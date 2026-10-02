@@ -17,6 +17,7 @@ const mocks = vi.hoisted(() => ({
     name: "Oracle",
     db_type: "oracle",
     driver_label: "Oracle",
+    database_info: { productVersion: "3.5.0" },
   },
   ensureConnected: vi.fn(),
   executeQuery: vi.fn(),
@@ -258,6 +259,8 @@ vi.mock("@/lib/backend/api", () => ({
 }));
 
 import TableStructureEditor from "@/components/structure/TableStructureEditor.vue";
+import { emptyStarRocksPhysicalOptions } from "@/lib/table/starrocksPhysicalOptions";
+import type { TableStructureEditorDraft } from "@/types/database";
 
 const mountedApps: App[] = [];
 
@@ -370,5 +373,64 @@ describe("TableStructureEditor created-table name write-back", () => {
   it("keeps a quoting-required Oracle name exactly as typed", async () => {
     const saved = await createTableAndCaptureSaved("oracle", "my table");
     expect(saved.createdTableName).toBe("my table");
+  });
+});
+
+describe("StarRocks create layout integration", () => {
+  it("restores layout drafts, sends dialect options, and persists bucket and sort priority edits", async () => {
+    const previousType = mocks.connection.db_type;
+    mocks.connection.db_type = "starrocks";
+    try {
+      const root = document.createElement("div");
+      document.body.append(root);
+      let latestDraft: TableStructureEditorDraft | undefined;
+      const app = createApp(TableStructureEditor, {
+        connectionId: mocks.connection.id,
+        database: "test",
+        tableName: "",
+        draft: {
+          dirty: true,
+          activeTab: "columns",
+          newTableName: "events",
+          tableComment: "",
+          originalTableComment: "",
+          columns: [
+            { id: "id", name: "id", dataType: "bigint", isNullable: false, defaultValue: "", comment: "", isPrimaryKey: false, extra: {}, markedForDrop: false },
+            { id: "ts", name: "event_time", dataType: "datetime", isNullable: false, defaultValue: "", comment: "", isPrimaryKey: false, extra: {}, markedForDrop: false },
+          ],
+          indexes: [],
+          foreignKeys: [],
+          triggers: [],
+          initialized: true,
+          starrocksPhysicalOptions: { ...emptyStarRocksPhysicalOptions(), partitionKind: "time", partitionColumnId: "ts", bucketCount: "8", sortColumnIds: ["ts", "id"] },
+        },
+        "onUpdate:draft": (draft) => {
+          latestDraft = draft;
+        },
+      });
+      mountedApps.push(app);
+      app.mount(root);
+      await vi.waitFor(() =>
+        expect(mocks.buildCreateTableSql).toHaveBeenCalledWith(
+          expect.objectContaining({ tableName: "events", databaseType: "starrocks" }),
+          "3.5.0",
+          expect.objectContaining({ starrocks: expect.objectContaining({ timePartition: expect.objectContaining({ columnId: "ts", granularity: "month" }), bucketCount: 8, sortColumnIds: ["ts", "id"] }) }),
+        ),
+      );
+      const panel = root.querySelector("[data-starrocks-physical-options]");
+      expect(panel).not.toBeNull();
+      const sortPanel = panel!.querySelector("[data-starrocks-sort]")!;
+      const moveDown = sortPanel.querySelector<HTMLButtonElement>('button[aria-label="starrocksLayout.moveSortDown"]')!;
+      moveDown.click();
+      await vi.waitFor(() => expect(latestDraft?.starrocksPhysicalOptions?.sortColumnIds).toEqual(["id", "ts"]));
+      await vi.waitFor(() => expect(mocks.buildCreateTableSql).toHaveBeenLastCalledWith(expect.anything(), "3.5.0", expect.objectContaining({ starrocks: expect.objectContaining({ sortColumnIds: ["id", "ts"] }) })));
+      const bucketInput = panel!.querySelector<HTMLInputElement>("[data-starrocks-buckets] input[type=number]")!;
+      bucketInput.value = "12";
+      bucketInput.dispatchEvent(new Event("input", { bubbles: true }));
+      await vi.waitFor(() => expect(latestDraft?.starrocksPhysicalOptions?.bucketCount).toBe("12"));
+      await vi.waitFor(() => expect(mocks.buildCreateTableSql).toHaveBeenLastCalledWith(expect.anything(), "3.5.0", expect.objectContaining({ starrocks: expect.objectContaining({ bucketCount: 12 }) })));
+    } finally {
+      mocks.connection.db_type = previousType;
+    }
   });
 });

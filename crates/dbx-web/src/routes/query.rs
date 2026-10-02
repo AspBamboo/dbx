@@ -273,6 +273,10 @@ pub struct BuildViewDdlRequest {
 #[serde(rename_all = "camelCase")]
 pub struct BuildTableStructureSqlRequest {
     pub options: dbx_core::table_structure_sql::TableStructureSqlOptions,
+    #[serde(default)]
+    pub server_version: Option<String>,
+    #[serde(default)]
+    pub dialect_options: Option<dbx_core::table_structure_sql::CreateTableDialectOptions>,
 }
 
 #[derive(Deserialize)]
@@ -1149,7 +1153,11 @@ pub async fn apply_sqlite_table_structure_change(
 pub async fn build_create_table_sql(
     Json(req): Json<BuildTableStructureSqlRequest>,
 ) -> Json<dbx_core::table_structure_sql::TableStructureSqlResult> {
-    Json(dbx_core::table_structure_sql::build_create_table_sql(req.options))
+    Json(dbx_core::table_structure_sql::build_create_table_sql_with_dialect_options(
+        req.options,
+        req.server_version.as_deref(),
+        req.dialect_options.unwrap_or_default(),
+    ))
 }
 
 pub async fn build_single_column_alter_sql(

@@ -1,3 +1,4 @@
+import type { CreateTableDialectOptions } from "@/lib/table/starrocksPhysicalOptions";
 import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
 import type { MongoRestoreUpload, MongoSourceReadOptions } from "./mongodbDumpTypes";
 import type { UserSkillRootSettings, UserSkillsListResult, UserSkillsReadResult } from "@/types/userSkills";
@@ -1863,8 +1864,8 @@ export async function applySqliteTableStructureChange(connectionId: string, data
   });
 }
 
-export async function buildCreateTableSql(options: BuildTableStructureChangeSqlOptions): Promise<TableStructureChangeSql> {
-  return post("/api/query/build-create-table-sql", { options });
+export async function buildCreateTableSql(options: BuildTableStructureChangeSqlOptions, serverVersion?: string, dialectOptions?: CreateTableDialectOptions): Promise<TableStructureChangeSql> {
+  return post("/api/query/build-create-table-sql", { options, serverVersion, dialectOptions });
 }
 
 export async function buildSingleColumnAlterSql(options: BuildSingleColumnAlterSqlOptions): Promise<TableStructureChangeSql> {

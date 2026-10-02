@@ -1783,6 +1783,7 @@ export interface TableStructureEditorDraft {
   mysqlTableEngine?: string;
   originalMysqlTableEngine?: string;
   physicalOptions?: import("@/lib/table/tablePhysicalOptions").TablePhysicalOptionsDraft;
+  starrocksPhysicalOptions?: import("@/lib/table/starrocksPhysicalOptions").StarRocksPhysicalOptionsDraft;
   tableOwner?: string;
   originalTableOwner?: string;
   columns: import("@/lib/table/tableStructureEditorSql").EditableStructureColumn[];

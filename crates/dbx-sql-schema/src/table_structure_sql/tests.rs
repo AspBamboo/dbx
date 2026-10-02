@@ -249,6 +249,38 @@ fn sqlite_autoincrement_rejects_composite_primary_keys_and_non_integer_types() {
 }
 
 #[test]
+fn starrocks_create_table_preserves_native_column_types() {
+    let types = [
+        "BIGINT",
+        "DATETIME",
+        "LARGEINT",
+        "DECIMAL(18,4)",
+        "ARRAY<INT>",
+        "MAP<INT, INT>",
+        "STRUCT<name VARCHAR(64), amount DECIMAL(18,2)>",
+    ];
+    let columns = types
+        .iter()
+        .enumerate()
+        .map(|(index, data_type)| {
+            let mut col = column(&format!("c{index}"));
+            col.data_type = data_type.to_string();
+            col
+        })
+        .collect();
+    let mut options = structure_change_options(DatabaseType::StarRocks, None, "test2", columns);
+    options.table_comment = Some("test".to_string());
+    let result = build_create_table_sql(options);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements.len(), 1);
+    for (index, data_type) in types.iter().enumerate() {
+        assert!(result.statements[0].contains(&format!("`c{index}` {data_type}")), "{}", result.statements[0]);
+    }
+    assert!(!result.statements[0].to_lowercase().contains("unsigned"));
+    assert!(!result.statements[0].to_lowercase().contains("timestamp"));
+}
+
+#[test]
 fn mysql_create_table_includes_engine_before_comment() {
     let mut options = structure_change_options(DatabaseType::Mysql, Some("dbx_test"), "archive", vec![column("id")]);
     options.mysql_engine = Some("MyISAM".to_string());
@@ -9304,4 +9336,284 @@ fn create_partitioned_table_is_supported_for_kingbase() {
 
     assert!(result.warnings.is_empty(), "{:?}", result.warnings);
     assert!(result.statements[0].ends_with(") PARTITION BY LIST (\"region\");"), "{}", result.statements[0]);
+}
+
+#[test]
+fn starrocks_35_create_primary_key_uses_native_clauses() {
+    let mut id = column("id");
+    id.data_type = "bigint(20)".into();
+    id.is_primary_key = true;
+    let mut options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![id, column("value")]);
+    options.table_comment = Some("owner's events".into());
+    let result = build_create_table_sql_for_version(options.clone(), Some("3.5.0 abc123"));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec!["CREATE TABLE `events` (\n  `id` bigint(20) NOT NULL,\n  `value` varchar(255)\n) PRIMARY KEY (`id`) COMMENT 'owner''s events' DISTRIBUTED BY HASH (`id`);"]);
+    options.database_type = Some(DatabaseType::Mysql);
+    options.driver_profile = Some("starrocks".into());
+    assert_eq!(build_create_table_sql_for_version(options.clone(), Some("3.5.0")).statements, result.statements);
+    options.driver_profile = None;
+    let mysql = build_create_table_sql_for_version(options, Some("8.0.0"));
+    assert!(mysql.warnings.is_empty());
+    assert!(mysql.statements[0].contains(",\n  PRIMARY KEY (`id`)\n) COMMENT ="));
+    assert!(!mysql.statements[0].contains("DISTRIBUTED"));
+}
+
+#[test]
+fn starrocks_distribution_uses_server_version() {
+    let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![column("id")]);
+    for (version, suffix) in [
+        (None, "HASH (`id`) BUCKETS 10;"),
+        (Some("5.1.0"), "HASH (`id`) BUCKETS 10;"),
+        (Some("2.5.6"), "HASH (`id`) BUCKETS 10;"),
+        (Some("2.5.7"), "HASH (`id`);"),
+        (Some("3.0.0"), "HASH (`id`);"),
+        (Some("StarRocks version 3.5.0"), "RANDOM;"),
+    ] {
+        let result = build_create_table_sql_for_version(options.clone(), version);
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.statements[0].ends_with(suffix), "{}", result.statements[0]);
+    }
+}
+
+#[test]
+fn starrocks_places_primary_keys_before_value_columns() {
+    let mut id = column("id");
+    id.is_primary_key = true;
+    let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![column("value"), id]);
+    let result = build_create_table_sql_for_version(options, Some("3.5.0"));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    let sql = &result.statements[0];
+    assert!(sql.find("`id` varchar").unwrap() < sql.find("`value` varchar").unwrap());
+    assert!(sql.contains(") PRIMARY KEY (`id`)"));
+}
+
+fn starrocks_layout_options(granularity: StarRocksTimeGranularity) -> CreateTableDialectOptions {
+    CreateTableDialectOptions {
+        starrocks: Some(StarRocksCreateOptions {
+            partition: None,
+            time_partition: Some(StarRocksTimePartition { column_id: "ts".into(), granularity, interval: None, additional_column_ids: vec![] }),
+            distribution: StarRocksDistribution::Hash,
+            distribution_column_ids: vec!["id".into()],
+            sort_column_ids: vec![],
+            bucket_count: Some(8),
+        }),
+    }
+}
+
+fn starrocks_partitioned_table_options() -> TableStructureSqlOptions {
+    let mut id = column("id");
+    id.data_type = "bigint".into();
+    id.is_primary_key = true;
+    let mut ts = column("ts");
+    ts.data_type = "datetime".into();
+    ts.is_primary_key = true;
+    let mut options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![id, ts]);
+    options.table_comment = Some("events".into());
+    options
+}
+
+#[test]
+fn starrocks_time_partition_preserves_clause_order_and_column_identity() {
+    for (granularity, unit) in [(StarRocksTimeGranularity::Year, "year"), (StarRocksTimeGranularity::Month, "month"), (StarRocksTimeGranularity::Day, "day")] {
+        let mut options = starrocks_partitioned_table_options();
+        // Column ID stays stable through a rename, including quoted identifiers.
+        options.columns[1].name = "event`time".into();
+        let result = build_create_table_sql_with_dialect_options(options, Some("3.5.0"), starrocks_layout_options(granularity));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert_eq!(result.statements.len(), 1);
+        assert!(result.statements[0].ends_with(&format!(") PRIMARY KEY (`id`, `event``time`) COMMENT 'events' PARTITION BY date_trunc('{unit}', `event``time`) DISTRIBUTED BY HASH (`id`) BUCKETS 8;")), "{}", result.statements[0]);
+    }
+}
+
+#[test]
+fn starrocks_rejects_invalid_partition_columns_and_versions() {
+    let settings = starrocks_layout_options(StarRocksTimeGranularity::Month);
+    for version in [None, Some("5.1.0"), Some("3.0.0")] {
+        let result = build_create_table_sql_with_dialect_options(starrocks_partitioned_table_options(), version, settings.clone());
+        assert!(result.statements.is_empty());
+        assert!(result.warnings.iter().any(|warning| warning.contains("confirmed server version")));
+    }
+    for change in ["drop", "type", "primary"] {
+        let mut options = starrocks_partitioned_table_options();
+        match change {
+            "drop" => options.columns[1].marked_for_drop = true,
+            "type" => options.columns[1].data_type = "varchar(255)".into(),
+            _ => options.columns[1].is_primary_key = false,
+        }
+        let result = build_create_table_sql_with_dialect_options(options, Some("3.5.0"), settings.clone());
+        assert!(result.statements.is_empty(), "{change}");
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn starrocks_validates_hash_keys_and_bucket_count() {
+    for case in ["missing", "empty", "duplicate", "type", "primary", "zero", "overflow"] {
+        let mut options = starrocks_partitioned_table_options();
+        let mut settings = starrocks_layout_options(StarRocksTimeGranularity::Day);
+        let sr = settings.starrocks.as_mut().unwrap();
+        sr.time_partition = None;
+        match case {
+            "missing" => sr.distribution_column_ids = vec!["removed".into()],
+            "empty" => sr.distribution_column_ids.clear(),
+            "duplicate" => sr.distribution_column_ids = vec!["id".into(), "id".into()],
+            "type" => options.columns[0].data_type = "json".into(),
+            "primary" => { options.columns[1].is_primary_key = false; sr.distribution_column_ids = vec!["ts".into()]; },
+            "zero" => sr.bucket_count = Some(0),
+            _ => sr.bucket_count = Some(u32::MAX),
+        }
+        let result = build_create_table_sql_with_dialect_options(options, Some("3.5.0"), settings);
+        assert!(result.statements.is_empty(), "{case}");
+        assert!(!result.warnings.is_empty());
+    }
+}
+
+#[test]
+fn starrocks_random_distribution_requires_duplicate_table_and_supported_version() {
+    let settings = CreateTableDialectOptions { starrocks: Some(StarRocksCreateOptions { distribution: StarRocksDistribution::Random, ..Default::default() }) };
+    let mut options = starrocks_partitioned_table_options();
+    assert!(build_create_table_sql_with_dialect_options(options.clone(), Some("3.5.0"), settings.clone()).statements.is_empty());
+    for column in &mut options.columns { column.is_primary_key = false; }
+    assert!(build_create_table_sql_with_dialect_options(options.clone(), Some("3.0.0"), settings.clone()).statements.is_empty());
+    let result = build_create_table_sql_with_dialect_options(options, Some("3.5.0"), settings);
+    assert!(result.warnings.is_empty());
+    assert!(result.statements[0].ends_with("DISTRIBUTED BY RANDOM;"));
+}
+
+#[test]
+fn starrocks_settings_cannot_leak_into_mysql() {
+    let mut options = starrocks_partitioned_table_options();
+    options.database_type = Some(DatabaseType::Mysql);
+    let result = build_create_table_sql_with_dialect_options(options, Some("8.0"), starrocks_layout_options(StarRocksTimeGranularity::Month));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.iter().any(|warning| warning.contains("require a StarRocks connection")));
+}
+
+#[test]
+fn starrocks_builds_multicolumn_value_and_list_partitions() {
+    let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![column("city"), column("channel")]);
+    let values = CreateTableDialectOptions { starrocks: Some(StarRocksCreateOptions {
+        partition: Some(StarRocksPartitionOptions::Values { column_ids: vec!["city".into(), "channel".into()] }), ..Default::default()
+    }) };
+    let result = build_create_table_sql_with_dialect_options(options.clone(), Some("3.5.0"), values);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.statements[0].contains("PARTITION BY (`city`, `channel`) DISTRIBUTED BY RANDOM"));
+    let list = CreateTableDialectOptions { starrocks: Some(StarRocksCreateOptions {
+        partition: Some(StarRocksPartitionOptions::List {
+            column_ids: vec!["city".into(), "channel".into()],
+            partitions: vec![StarRocksListPartition { name: "p`east".into(), values: vec![vec!["Xi'an".into(), "web".into()], vec!["Shanghai".into(), "store".into()]] }],
+        }), ..Default::default()
+    }) };
+    let result = build_create_table_sql_with_dialect_options(options, Some("3.5.0"), list);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.statements[0].contains("PARTITION BY LIST (`city`, `channel`) (\n  PARTITION `p``east` VALUES IN (('Xi''an', 'web'), ('Shanghai', 'store'))\n)"));
+}
+
+#[test]
+fn starrocks_builds_range_bounds_and_validates_arity() {
+    let mut options = starrocks_partitioned_table_options();
+    // Intentionally interleaved primary and value columns: SQL reorders without changing membership.
+    options.columns.insert(1, column("payload"));
+    let settings = CreateTableDialectOptions { starrocks: Some(StarRocksCreateOptions {
+        partition: Some(StarRocksPartitionOptions::Range { column_ids: vec!["ts".into(), "id".into()], partitions: vec![StarRocksRangePartition { name: "p2026".into(), lower: vec!["2026-01-01".into(), "0".into()], upper: vec!["2027-01-01".into(), "0".into()] }] }), ..Default::default()
+    }) };
+    let result = build_create_table_sql_with_dialect_options(options.clone(), Some("3.5.0"), settings.clone());
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.statements[0].contains("PARTITION BY RANGE (`ts`, `id`) (\n  PARTITION `p2026` VALUES [('2026-01-01', '0'), ('2027-01-01', '0'))\n)"));
+    assert!(result.statements[0].find("`ts` datetime").unwrap() < result.statements[0].find("`payload` varchar").unwrap());
+    let mut invalid = settings;
+    if let Some(StarRocksPartitionOptions::Range { partitions, .. }) = invalid.starrocks.as_mut().unwrap().partition.as_mut() { partitions[0].upper.pop(); }
+    assert!(build_create_table_sql_with_dialect_options(options, Some("3.5.0"), invalid).statements.is_empty());
+}
+
+#[test]
+fn starrocks_time_slice_and_mixed_partitions_are_version_and_type_checked() {
+    let options = starrocks_partitioned_table_options();
+    let mut settings = starrocks_layout_options(StarRocksTimeGranularity::Day);
+    let time = settings.starrocks.as_mut().unwrap().time_partition.as_mut().unwrap();
+    time.interval = Some(7);
+    time.additional_column_ids = vec!["id".into()];
+    let result = build_create_table_sql_with_dialect_options(options.clone(), Some("3.5.0"), settings.clone());
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.statements[0].contains("PARTITION BY time_slice(`ts`, INTERVAL 7 day), `id` DISTRIBUTED"));
+    assert!(build_create_table_sql_with_dialect_options(options.clone(), Some("3.3.0"), settings.clone()).statements.is_empty());
+    let mut invalid = options;
+    invalid.columns[1].data_type = "date".into();
+    assert!(build_create_table_sql_with_dialect_options(invalid, Some("3.5.0"), settings).statements.is_empty());
+}
+
+#[test]
+fn starrocks_rejects_duplicate_list_values_and_incompatible_partition_types() {
+    let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![column("city")]);
+    let list = CreateTableDialectOptions { starrocks: Some(StarRocksCreateOptions { partition: Some(StarRocksPartitionOptions::List {
+        column_ids: vec!["city".into()], partitions: vec![StarRocksListPartition { name: "p1".into(), values: vec![vec!["Beijing".into()], vec!["Beijing".into()]] }],
+    }), ..Default::default() }) };
+    assert!(build_create_table_sql_with_dialect_options(options.clone(), Some("3.5.0"), list).statements.is_empty());
+    let range = CreateTableDialectOptions { starrocks: Some(StarRocksCreateOptions { partition: Some(StarRocksPartitionOptions::Range { column_ids: vec!["city".into()], partitions: vec![StarRocksRangePartition { name: "p1".into(), lower: vec!["a".into()], upper: vec!["z".into()] }] }), ..Default::default() }) };
+    assert!(build_create_table_sql_with_dialect_options(options, Some("3.5.0"), range).statements.is_empty());
+}
+
+#[test]
+fn starrocks_sort_columns_preserve_priority_and_allow_non_primary_columns() {
+    let mut options = starrocks_partitioned_table_options();
+    options.columns[1].is_primary_key = false;
+    options.columns[1].name = "event`time".into();
+    let settings = CreateTableDialectOptions { starrocks: Some(StarRocksCreateOptions {
+        sort_column_ids: vec!["ts".into(), "id".into()], ..Default::default()
+    }) };
+    let result = build_create_table_sql_with_dialect_options(options, Some("3.5.0"), settings);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.statements[0].ends_with("DISTRIBUTED BY HASH (`id`) ORDER BY (`event``time`, `id`);"));
+}
+
+#[test]
+fn starrocks_sort_validates_version_identity_and_primary_table_types() {
+    for case in ["old", "unknown", "missing", "duplicate", "type", "dropped"] {
+        let mut options = starrocks_partitioned_table_options();
+        let mut ids = vec!["ts".into()];
+        let version = match case { "old" => Some("2.5.0"), "unknown" => None, _ => Some("3.5.0") };
+        match case {
+            "missing" => ids = vec!["missing".into()],
+            "duplicate" => ids.push("ts".into()),
+            "type" => { options.columns[1].is_primary_key = false; options.columns[1].data_type = "decimal(10,2)".into(); },
+            "dropped" => options.columns[1].marked_for_drop = true,
+            _ => {}
+        }
+        let settings = CreateTableDialectOptions { starrocks: Some(StarRocksCreateOptions { sort_column_ids: ids, ..Default::default() }) };
+        let result = build_create_table_sql_with_dialect_options(options, version, settings);
+        assert!(result.statements.is_empty(), "{case}");
+        assert!(!result.warnings.is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn starrocks_duplicate_sort_requires_33_and_allows_decimal() {
+    let mut options = starrocks_partitioned_table_options();
+    for column in &mut options.columns { column.is_primary_key = false; }
+    options.columns[1].data_type = "decimal(10,2)".into();
+    let settings = CreateTableDialectOptions { starrocks: Some(StarRocksCreateOptions { sort_column_ids: vec!["ts".into()], ..Default::default() }) };
+    let old = build_create_table_sql_with_dialect_options(options.clone(), Some("3.2.0"), settings.clone());
+    assert!(old.statements.is_empty());
+    let result = build_create_table_sql_with_dialect_options(options, Some("3.5.0"), settings);
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert!(result.statements[0].ends_with("DISTRIBUTED BY RANDOM ORDER BY (`ts`);"));
+}
+
+#[test]
+fn starrocks_default_presets_keep_literals_and_function_expressions() {
+    for (data_type, default_value) in [
+        ("int", "'0'"), ("decimal(10,2)", "'1'"), ("boolean", "'false'"),
+        ("date", "1970-01-01"), ("datetime", "CURRENT_TIMESTAMP"),
+        ("varchar(36)", "(uuid())"), ("largeint", "(uuid_numeric())"),
+        ("varchar(20)", "''"),
+    ] {
+        let mut options = starrocks_partitioned_table_options();
+        options.columns[1].is_primary_key = false;
+        options.columns[1].data_type = data_type.into();
+        options.columns[1].default_value = default_value.into();
+        let result = build_create_table_sql_for_version(options, Some("3.5.0"));
+        assert!(result.warnings.is_empty(), "{data_type}: {:?}", result.warnings);
+        let expected = if data_type == "date" { format!("'{default_value}'") } else { default_value.into() };
+        assert!(result.statements[0].contains(&format!("DEFAULT {expected}")), "{data_type}: {}", result.statements[0]);
+    }
 }

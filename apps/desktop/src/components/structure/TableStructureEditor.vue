@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { getColumnDefaultValuePresets } from "@/lib/table/columnDefaultPresets";
 import { applyDdlStoragePreference } from "@/lib/sql/ddlStorage";
 import DdlStorageToggle from "@/components/objects/DdlStorageToggle.vue";
 
@@ -16,6 +17,8 @@ import { DropdownMenu, DropdownMenuCheckboxItem, DropdownMenuContent, DropdownMe
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { SearchableSelect } from "@/components/ui/searchable-select";
+import StarRocksPhysicalOptionsEditor from "@/components/structure/StarRocksPhysicalOptionsEditor.vue";
+import { buildStarRocksDialectOptions, emptyStarRocksPhysicalOptions, hasStarRocksPhysicalOptions, restoreStarRocksPhysicalOptions } from "@/lib/table/starrocksPhysicalOptions";
 import TablePhysicalOptionsEditor from "@/components/structure/TablePhysicalOptionsEditor.vue";
 import CustomContextMenu, { type ContextMenuItem } from "@/components/ui/CustomContextMenu.vue";
 import EditorSearchPanel from "@/components/editor/EditorSearchPanel.vue";
@@ -1293,7 +1296,7 @@ const tableMetadataCapabilities = computed(() => getTableMetadataCapabilities(da
 const structureDialect = computed(() => structureCapabilities.value.dialect);
 const isTableCommentDisabled = computed(() => !structureCapabilities.value.comment);
 const dynamicDataTypeOptions = ref<string[]>([]);
-const dataTypeOptions = computed(() => mergeDataTypeOptions(dynamicDataTypeOptions.value, getDataTypeOptions(databaseType.value)));
+const dataTypeOptions = computed(() => getDataTypeOptions(databaseType.value, dynamicDataTypeOptions.value, connection.value?.database_info?.productVersion));
 const columnEditorControls = computed(() => getColumnEditorControls(databaseType.value));
 
 const indexTypesByDb: Record<string, string[]> = {
@@ -1312,70 +1315,17 @@ const indexTypeOptions = computed(() => {
   return indexTypesByDb[structureDialect.value] ?? [];
 });
 
-interface DefaultValuePreset {
-  label: string;
-  value: string;
+function defaultValuePresets(column: EditableStructureColumn) {
+  return getColumnDefaultValuePresets(column, {
+    databaseType: databaseType.value,
+    dialect: structureDialect.value,
+    serverVersion: connection.value?.database_info?.productVersion,
+    unsetLabel: t("structureEditor.unsetDefault"),
+  });
 }
 
-const defaultValuePresets = computed((): DefaultValuePreset[] => {
-  const universal: DefaultValuePreset[] = [
-    { label: "''", value: "''" },
-    { label: "NULL", value: "NULL" },
-    { label: "0", value: "0" },
-    { label: "1", value: "1" },
-  ];
-
-  const dialectPresets: Record<string, DefaultValuePreset[]> = {
-    mysql: [
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "CURRENT_DATE", value: "CURRENT_DATE" },
-      { label: "CURRENT_TIME", value: "CURRENT_TIME" },
-    ],
-    postgres: [
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "CURRENT_DATE", value: "CURRENT_DATE" },
-      { label: "now()", value: "now()" },
-      { label: "gen_random_uuid()", value: "gen_random_uuid()" },
-    ],
-    sqlite: [
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "CURRENT_DATE", value: "CURRENT_DATE" },
-      { label: "CURRENT_TIME", value: "CURRENT_TIME" },
-    ],
-    duckdb: [
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "CURRENT_DATE", value: "CURRENT_DATE" },
-    ],
-    sqlserver: [
-      { label: "GETDATE()", value: "GETDATE()" },
-      { label: "GETUTCDATE()", value: "GETUTCDATE()" },
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "NEWID()", value: "NEWID()" },
-    ],
-    oracle: [
-      { label: "SYSDATE", value: "SYSDATE" },
-      { label: "SYSTIMESTAMP", value: "SYSTIMESTAMP" },
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-    ],
-    h2: [
-      { label: "CURRENT_TIMESTAMP", value: "CURRENT_TIMESTAMP" },
-      { label: "CURRENT_DATE", value: "CURRENT_DATE" },
-    ],
-    clickhouse: [
-      { label: "now()", value: "now()" },
-      { label: "today()", value: "today()" },
-    ],
-    informix: [
-      { label: "CURRENT", value: "CURRENT" },
-      { label: "TODAY", value: "TODAY" },
-    ],
-  };
-
-  return [...universal, ...(dialectPresets[structureDialect.value] ?? [])];
-});
-
 const showExtendedProperties = computed(() => supportsTableStructureExtendedProperties(databaseType.value));
-const showCharacterSet = computed(() => structureDialect.value === "mysql");
+const showCharacterSet = computed(() => structureDialect.value === "mysql" && databaseType.value !== "starrocks");
 
 const serverCharsetMetadata = ref<CreateDatabaseCharsetMetadata>();
 const charsetMetadataLoading = ref(false);
@@ -1584,6 +1534,7 @@ const mysqlAutoIncrementLoadError = ref("");
 const mysqlTableEngine = ref("");
 const originalMysqlTableEngine = ref("");
 const physicalOptions = ref(emptyTablePhysicalOptions());
+const starrocksPhysicalOptions = ref(emptyStarRocksPhysicalOptions());
 watch(
   () => columns.value.filter((column) => !column.markedForDrop).map((column) => column.id),
   (ids) => {
@@ -1911,6 +1862,7 @@ function createCurrentDraft(initialized = true): TableStructureEditorDraft {
     mysqlTableEngine: mysqlTableEngine.value,
     originalMysqlTableEngine: originalMysqlTableEngine.value,
     physicalOptions: cloneDraftValue(physicalOptions.value),
+    starrocksPhysicalOptions: cloneDraftValue(starrocksPhysicalOptions.value),
     tableOwner: tableOwner.value,
     originalTableOwner: originalTableOwner.value,
     columns: cloneDraftValue(columns.value),
@@ -1989,6 +1941,7 @@ function restoreDraft(draft: TableStructureEditorDraft) {
   originalTableOwner.value = draft.originalTableOwner || "";
   columns.value = cloneDraftValue(draft.columns || []);
   physicalOptions.value = restoreTablePhysicalOptions(draft);
+  starrocksPhysicalOptions.value = restoreStarRocksPhysicalOptions(draft.starrocksPhysicalOptions);
   // Existing-index edits never support Concurrent (the checkbox is disabled and
   // the core builder rejects the request), so a stale `concurrently: true`
   // saved in a restored draft must not be submitted or deadlock the save.
@@ -2079,6 +2032,7 @@ function hasPendingStructureChanges(): boolean {
       !!tableComment.value.trim() ||
       mysqlTableEngine.value !== originalMysqlTableEngine.value ||
       hasTablePhysicalOptions(physicalOptions.value) ||
+      (databaseType.value === "starrocks" && hasStarRocksPhysicalOptions(starrocksPhysicalOptions.value)) ||
       columns.value.length > 0 ||
       indexes.value.length > 0 ||
       foreignKeys.value.length > 0 ||
@@ -2323,7 +2277,7 @@ async function refreshSqlPreview() {
       isCreateMode.value
         ? createPartitioningEnabled.value
           ? api.buildCreatePartitionedTableSql({ options, partitioning: { kind: createPartitioningKind.value, columns: createPartitioningColumns.value, expression: createPartitioningExpression.value } })
-          : api.buildCreateTableSql(options)
+          : api.buildCreateTableSql(options, connection.value?.database_info?.productVersion, databaseType.value === "starrocks" ? buildStarRocksDialectOptions(starrocksPhysicalOptions.value) : undefined)
         : hasSqliteTypeChange.value
           ? api.previewSqliteTableStructureChange(props.connectionId, props.database, options)
           : api.buildTableStructureChangeSql(options),
@@ -2440,6 +2394,7 @@ function resetState() {
   mysqlTableEngine.value = "";
   originalMysqlTableEngine.value = "";
   physicalOptions.value = emptyTablePhysicalOptions();
+  starrocksPhysicalOptions.value = emptyStarRocksPhysicalOptions();
   mysqlTableEngineOptions.value = [];
   mysqlTableEngineLoadRequestId += 1;
   mysqlTableEngineLoading.value = false;
@@ -4784,6 +4739,8 @@ watch([() => props.connectionId, () => props.database, databaseType], () => {
   void loadDynamicDataTypeOptions();
 });
 
+watch(() => connection.value?.database_info?.productVersion, scheduleSqlPreviewRefresh);
+
 watch(
   [
     isCreateMode,
@@ -4802,6 +4759,7 @@ watch(
     mysqlTableEngine,
     originalMysqlTableEngine,
     physicalOptions,
+    starrocksPhysicalOptions,
     mysqlTableEngineLoading,
     mysqlTableEngineLoadError,
     mysqlTableDefaultCollation,
@@ -5409,7 +5367,7 @@ watch(
                                 </Button>
                               </DropdownMenuTrigger>
                               <DropdownMenuContent align="end" class="max-h-56 min-w-36 overflow-y-auto">
-                                <DropdownMenuItem v-for="preset in defaultValuePresets" :key="preset.value" @click="column.defaultValue = preset.value">
+                                <DropdownMenuItem v-for="preset in defaultValuePresets(column)" :key="preset.value" @click="column.defaultValue = preset.value">
                                   <code class="font-mono text-[length:var(--structure-font-size)]">{{ preset.label }}</code>
                                 </DropdownMenuItem>
                               </DropdownMenuContent>
@@ -6146,6 +6104,8 @@ watch(
           </TabsContent>
         </Tabs>
       </div>
+
+      <StarRocksPhysicalOptionsEditor v-if="isCreateMode && databaseType === 'starrocks'" v-model="starrocksPhysicalOptions" :columns="columns" :server-version="connection?.database_info?.productVersion" :disabled="saving" />
 
       <div :class="['flex min-w-0 shrink-0 flex-col overflow-hidden rounded-md border', sqlPreviewCollapsed ? '' : 'h-[28%] min-h-40 max-h-64']">
         <div class="flex shrink-0 items-center justify-between border-b px-[var(--structure-cell-px)] py-[var(--structure-header-py)] text-[length:var(--structure-font-size)] font-medium">

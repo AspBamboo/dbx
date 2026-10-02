@@ -1,3 +1,4 @@
+import type { CreateTableDialectOptions } from "@/lib/table/starrocksPhysicalOptions";
 import { invoke as tauriInvoke } from "@tauri-apps/api/core";
 import { Channel } from "@tauri-apps/api/core";
 import type { MongoDumpFormat, MongoDumpSourceInput, MongoDumpCatalog, MongoRestoreSourcePreview, MongoDatabaseDumpRequest, MongoDatabaseRestoreRequest, MongoDatabaseDumpProgress } from "./mongodbDumpTypes";
@@ -2234,8 +2235,8 @@ export async function applySqliteTableStructureChange(connectionId: string, data
   });
 }
 
-export async function buildCreateTableSql(options: BuildTableStructureChangeSqlOptions): Promise<TableStructureChangeSql> {
-  return invoke("build_create_table_sql", { options });
+export async function buildCreateTableSql(options: BuildTableStructureChangeSqlOptions, serverVersion?: string, dialectOptions?: CreateTableDialectOptions): Promise<TableStructureChangeSql> {
+  return invoke("build_create_table_sql", { options, serverVersion, dialectOptions });
 }
 
 export async function buildSingleColumnAlterSql(options: BuildSingleColumnAlterSqlOptions): Promise<TableStructureChangeSql> {
