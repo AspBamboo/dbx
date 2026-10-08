@@ -9,7 +9,7 @@ import StarRocksPartitionOptionsEditor from "./StarRocksPartitionOptionsEditor.v
 import { getStarRocksCapabilities } from "@/lib/table/starrocksCapabilities";
 import { isStarRocksHashColumn, isStarRocksSortColumn, type StarRocksPhysicalOptionsDraft } from "@/lib/table/starrocksPhysicalOptions";
 import type { EditableStructureColumn } from "@/lib/table/tableStructureEditorSql";
-const props = defineProps<{ modelValue: StarRocksPhysicalOptionsDraft; columns: EditableStructureColumn[]; serverVersion?: string; disabled?: boolean }>();
+const props = defineProps<{ modelValue: StarRocksPhysicalOptionsDraft; columns: EditableStructureColumn[]; serverVersion?: string; disabled?: boolean; hidePartition?: boolean; hideSorting?: boolean }>();
 const emit = defineEmits<{ "update:modelValue": [value: StarRocksPhysicalOptionsDraft] }>();
 const { t } = useI18n();
 const capabilities = computed(() => getStarRocksCapabilities(props.serverVersion));
@@ -38,9 +38,9 @@ function update<K extends keyof StarRocksPhysicalOptionsDraft>(key: K, value: St
 </script>
 <template>
   <details open class="shrink-0 rounded-md border bg-muted/10 px-3 py-2" data-starrocks-physical-options>
-    <summary class="cursor-pointer font-medium">{{ t("starrocksLayout.title") }}</summary>
+    <summary class="cursor-pointer font-medium">{{ t(hideSorting ? "starrocksLayout.partitionAndBucketTitle" : "starrocksLayout.title") }}</summary>
     <div class="mt-2 max-h-72 space-y-3 overflow-y-auto pr-1">
-      <StarRocksPartitionOptionsEditor :model-value="modelValue" :columns="activeColumns" :server-version="serverVersion" :disabled="disabled" @update:model-value="emit('update:modelValue', $event)" />
+      <StarRocksPartitionOptionsEditor v-if="!hidePartition" :model-value="modelValue" :columns="activeColumns" :server-version="serverVersion" :disabled="disabled" @update:model-value="emit('update:modelValue', $event)" />
       <section class="space-y-2 border-t pt-2" data-starrocks-buckets>
         <div class="flex flex-wrap items-end gap-3">
           <div class="space-y-1">
@@ -63,7 +63,7 @@ function update<K extends keyof StarRocksPhysicalOptionsDraft>(key: K, value: St
         <p class="text-xs text-muted-foreground">{{ t("starrocksLayout.bucketCountHint") }}</p>
         <p class="text-xs text-muted-foreground">{{ modelValue.distribution === "auto" ? t(hasPrimaryKey ? "starrocksLayout.autoPrimaryHint" : "starrocksLayout.autoDuplicateHint") : t("starrocksLayout.bucketHint") }}</p>
       </section>
-      <section class="space-y-2 border-t pt-2" data-starrocks-sort>
+      <section v-if="!hideSorting" class="space-y-2 border-t pt-2" data-starrocks-sort>
         <StructureColumnMultiSelect :model-value="modelValue.sortColumnIds" :columns="sortColumns" :label="t('starrocksLayout.sortColumns')" :disabled="disabled || !supportsSorting" @update:model-value="update('sortColumnIds', $event)" />
         <ol v-if="modelValue.sortColumnIds.length" class="space-y-1">
           <li v-for="(id, index) in modelValue.sortColumnIds" :key="id" class="flex items-center gap-2">

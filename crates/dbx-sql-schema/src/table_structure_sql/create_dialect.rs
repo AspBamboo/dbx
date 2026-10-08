@@ -77,7 +77,7 @@ pub(super) fn create_table_dialect(
     }
 }
 
-fn parse_version(raw: Option<&str>) -> Option<(u32, u32, u32)> {
+pub(super) fn parse_version(raw: Option<&str>) -> Option<(u32, u32, u32)> {
     let normalized = raw?.trim().to_ascii_lowercase();
     let raw = normalized.as_str();
     let raw = raw

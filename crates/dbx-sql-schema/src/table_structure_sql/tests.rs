@@ -5377,7 +5377,7 @@ fn mysql_compatible_database_keeps_existing_primary_key_statement_sequence() {
     id.extra = Some(ColumnExtra { auto_increment: Some(true), ..Default::default() });
 
     let result = build_table_structure_change_sql(structure_change_options(
-        DatabaseType::StarRocks,
+        DatabaseType::Goldendb,
         None,
         "users",
         vec![old_pk, id],
@@ -9615,5 +9615,396 @@ fn starrocks_default_presets_keep_literals_and_function_expressions() {
         assert!(result.warnings.is_empty(), "{data_type}: {:?}", result.warnings);
         let expected = if data_type == "date" { format!("'{default_value}'") } else { default_value.into() };
         assert!(result.statements[0].contains(&format!("DEFAULT {expected}")), "{data_type}: {}", result.statements[0]);
+    }
+}
+
+fn starrocks_alter_context() -> StarRocksAlterOptions {
+    StarRocksAlterOptions {
+        server_version: Some("3.5.0".into()), model: Some("primary".into()),
+        key_columns: vec!["id".into()], distribution_columns: vec!["id".into()],
+        ..Default::default()
+    }
+}
+
+#[test]
+fn starrocks_alter_combines_schema_changes_after_native_rename_and_comments() {
+    let mut value = existing_pk_column("value", "varchar(100)", false, false);
+    value.name = "new`value".into();
+    value.comment = "new comment".into();
+    value.default_value = "hello".into();
+    let mut added = column("more");
+    added.data_type = "int".into();
+    let mut options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![value, added]);
+    options.table_comment = Some("table comment".into());
+    let result = build_table_structure_change_sql_with_context(options, Some(starrocks_alter_context()));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements.len(), 3);
+    assert_eq!(result.statements[0], "ALTER TABLE `events` RENAME COLUMN `value` TO `new``value`;");
+    assert!(result.statements[1].contains("COMMENT = 'table comment'"));
+    assert!(result.statements[2].contains("MODIFY COLUMN `new``value` varchar(100) NOT NULL DEFAULT 'hello' COMMENT 'new comment', ADD COLUMN `more` int NULL COMMENT '';"));
+    assert!(!result.statements.join(" ").contains("CHANGE COLUMN"));
+}
+
+#[test]
+fn starrocks_alter_comment_only_does_not_redefine_primary_column() {
+    let mut key = existing_pk_column("id", "bigint", true, true);
+    key.comment = "owner's id".into();
+    let mut options = structure_change_options(DatabaseType::Mysql, None, "events", vec![key]);
+    options.driver_profile = Some("starrocks".into());
+    let result = build_table_structure_change_sql_with_context(options, Some(starrocks_alter_context()));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec!["ALTER TABLE `events` MODIFY COLUMN `id` COMMENT 'owner''s id';"]);
+}
+
+#[test]
+fn starrocks_alter_rejects_unsupported_changes_without_partial_plan() {
+    for case in ["primary", "nullable", "missing", "aggregate", "old_rename", "partition", "drop"] {
+        let mut value = existing_pk_column("value", "int", false, false);
+        let mut context = starrocks_alter_context();
+        match case {
+            "primary" => value.is_primary_key = true,
+            "nullable" => value.original.as_mut().unwrap().is_nullable = true,
+            "missing" => { context.model = None; value.default_value = "0".into(); },
+            "aggregate" => { context.model = Some("aggregate".into()); value.data_type = "bigint".into(); },
+            "old_rename" => { context.server_version = Some("3.3.1".into()); value.name = "renamed".into(); },
+            "partition" => { context.partition_columns.push("value".into()); value.data_type = "bigint".into(); },
+            "drop" => { context.distribution_columns.push("value".into()); value.marked_for_drop = true; },
+            _ => {}
+        }
+        let mut options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![value]);
+        options.table_comment = Some("would otherwise succeed".into());
+        let result = build_table_structure_change_sql_with_context(options, Some(context));
+        assert!(result.statements.is_empty(), "{case}: {:?}", result.statements);
+        assert!(!result.warnings.is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn starrocks_duplicate_key_alter_preserves_key_and_allows_not_null_to_null() {
+    let mut value = existing_pk_column("key1", "varchar(100)", false, false);
+    value.data_type = "varchar(200)".into();
+    value.is_nullable = true;
+    let mut context = starrocks_alter_context();
+    context.model = Some("duplicate".into());
+    context.key_columns = vec!["key1".into()];
+    let result = build_table_structure_change_sql_with_context(
+        structure_change_options(DatabaseType::StarRocks, None, "events", vec![value]), Some(context));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec!["ALTER TABLE `events` MODIFY COLUMN `key1` varchar(200) KEY NULL COMMENT '';"]);
+}
+
+#[test]
+fn starrocks_existing_layout_changes_use_native_sql_and_quote_values() {
+    let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![existing_pk_column("id", "bigint", true, true)]);
+    let context: StarRocksAlterOptions = serde_json::from_value(serde_json::json!({
+        "serverVersion": "3.5.0", "model": "duplicate", "keyColumns": ["id"],
+        "layout": { "distribution": { "method": "hash", "columns": ["id"], "buckets": 12 } }
+    })).unwrap();
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec!["ALTER TABLE `events` DISTRIBUTED BY HASH(`id`) BUCKETS 12;"]);
+    let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![]);
+    let context: StarRocksAlterOptions = serde_json::from_value(serde_json::json!({
+        "serverVersion": "3.5.0", "model": "duplicate", "partitionKind": "list", "partitionColumns": ["city", "channel"],
+        "layout": { "partitions": [{ "kind": "addList", "name": "p`new", "values": [["O'Brien", "app"]] }, { "kind": "replicas", "name": "*", "replicas": 2 }] }
+    })).unwrap();
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec![
+        "ALTER TABLE `events` ADD PARTITION `p``new` VALUES IN (('O''Brien', 'app'));",
+        "ALTER TABLE `events` MODIFY PARTITION (*) SET (\"replication_num\" = \"2\");"
+    ]);
+}
+
+#[test]
+fn starrocks_layout_blocks_conflicting_jobs_invalid_buckets_and_model() {
+    for (version, model, buckets, edited, colocated) in [
+        ("3.1.9", "duplicate", 8, false, false),
+        ("3.5.0", "primary", 8, false, false),
+        ("3.5.0", "duplicate", 0, false, false),
+        ("3.5.0", "duplicate", 8, true, false),
+        ("3.5.0", "duplicate", 8, false, true),
+    ] {
+        let mut column = existing_pk_column("value", "varchar(20)", false, false);
+        if edited { column.name = "new_value".into(); }
+        let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![column]);
+        let context: StarRocksAlterOptions = serde_json::from_value(serde_json::json!({
+            "serverVersion": version, "model": model, "colocated": colocated,
+            "layout": { "distribution": { "method": "random", "buckets": buckets } }
+        })).unwrap();
+        let result = build_table_structure_change_sql_with_context(options, Some(context));
+        assert!(!result.warnings.is_empty(), "{version} {model}");
+        assert!(result.statements.is_empty());
+    }
+}
+
+#[test]
+fn starrocks_default_buckets_are_patch_version_gated() {
+    for (version, supported) in [("3.5.7", false), ("3.5.8", true), ("4.0.0", false), ("4.0.1", true)] {
+        let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![existing_pk_column("id", "bigint", true, true)]);
+        let context: StarRocksAlterOptions = serde_json::from_value(serde_json::json!({
+            "serverVersion": version, "model": "primary", "keyColumns": ["id"],
+            "distribution": { "method": "hash", "columns": ["id"], "buckets": 8 },
+            "layout": { "distribution": { "method": "hash", "columns": ["id"], "buckets": 12, "defaultOnly": true } }
+        })).unwrap();
+        let result = build_table_structure_change_sql_with_context(options, Some(context));
+        assert_eq!(result.warnings.is_empty(), supported, "{version} {:?}", result.warnings);
+        if supported { assert_eq!(result.statements, vec!["ALTER TABLE `events` DISTRIBUTED BY HASH(`id`) DEFAULT BUCKETS 12;"]); }
+    }
+}
+
+#[test]
+fn starrocks_manual_range_and_partition_drop_sql() {
+    let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![]);
+    let context: StarRocksAlterOptions = serde_json::from_value(serde_json::json!({
+        "serverVersion": "3.5.0", "model": "duplicate", "partitionKind": "range", "partitionColumns": ["dt"],
+        "layout": { "partitions": [{ "kind": "addRange", "name": "p2", "lower": ["2026-01-01"], "upper": ["2026-02-01"] }, { "kind": "drop", "name": "p1" }] }
+    })).unwrap();
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec![
+        "ALTER TABLE `events` ADD PARTITION `p2` VALUES [('2026-01-01'), ('2026-02-01'));",
+        "ALTER TABLE `events` DROP PARTITION `p1`;"
+    ]);
+}
+
+#[test]
+fn starrocks_automatic_bucket_scaling_blocks_distribution_but_not_partition_management() {
+    let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![existing_pk_column("id", "bigint", false, false)]);
+    let mut context: StarRocksAlterOptions = serde_json::from_value(serde_json::json!({
+        "serverVersion": "3.5.0", "model": "duplicate", "automaticBucketScaling": true,
+        "layout": { "distribution": { "method": "hash", "columns": ["id"], "buckets": 16 } }
+    })).unwrap();
+    let result = build_table_structure_change_sql_with_context(options.clone(), Some(context.clone()));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.iter().any(|warning| warning.contains("automatic bucket scaling")));
+    context.layout = Some(serde_json::from_value(serde_json::json!({ "partitions": [{ "kind": "replicas", "name": "*", "replicas": 2 }] })).unwrap());
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec!["ALTER TABLE `events` MODIFY PARTITION (*) SET (\"replication_num\" = \"2\");"]);
+}
+
+fn starrocks_reorder_fixture() -> (TableStructureSqlOptions, StarRocksAlterOptions) {
+    let mut columns = vec![existing_pk_column("id", "bigint", false, false), existing_pk_column("price", "decimal(7, 0)", false, false), existing_pk_column("name", "varchar(500)", false, false)];
+    for (index, column) in columns.iter_mut().enumerate() { column.original_position = Some(index); }
+    columns.swap(1, 2);
+    let options = structure_change_options(DatabaseType::StarRocks, None, "test4", columns);
+    let context = StarRocksAlterOptions { server_version: Some("3.5.0".into()), model: Some("duplicate".into()),
+        key_columns: vec!["id".into()], column_names: vec!["id".into(), "price".into(), "name".into()], position_column_order: true, ..Default::default() };
+    (options, context)
+}
+
+#[test]
+fn starrocks_reorders_values_with_position_clauses_not_sort_keys() {
+    let (options, context) = starrocks_reorder_fixture();
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec!["ALTER TABLE `test4` MODIFY COLUMN `name` varchar(500) NOT NULL COMMENT '' AFTER `id`;"]);
+    assert!(result.statements.iter().all(|sql| !sql.contains("ORDER BY")));
+}
+
+#[test]
+fn starrocks_reorder_guards_complete_schema_primary_keys_and_combined_add_drop() {
+    for case in ["primary", "missing_column", "missing_position", "add", "drop"] {
+        let (mut options, mut context) = starrocks_reorder_fixture();
+        if matches!(case, "missing_column" | "drop") {
+            let mut extra = existing_pk_column("extra", "int", false, false);
+            extra.original_position = Some(3);
+            options.columns.push(extra);
+            context.column_names.push("extra".into());
+        }
+        match case {
+            "primary" => context.model = Some("primary".into()),
+            "missing_column" => { options.columns.pop(); },
+            "missing_position" => options.columns[1].original_position = None,
+            "add" => options.columns.push(column("more")),
+            "drop" => options.columns.last_mut().unwrap().marked_for_drop = true,
+            _ => unreachable!(),
+        }
+        let result = build_table_structure_change_sql_with_context(options, Some(context));
+        assert!(result.statements.is_empty(), "{case} {:?}", result.statements);
+        assert!(!result.warnings.is_empty(), "{case}");
+    }
+}
+
+#[test]
+fn starrocks_reorders_partition_keys_preserving_key_identity_and_sort_keys() {
+    let mut day = existing_pk_column("day", "datetime", false, false);
+    day.is_nullable = true;
+    day.original.as_mut().unwrap().is_nullable = true;
+    day.original_position = Some(0);
+    let mut id = existing_pk_column("id", "varchar(255)", false, false);
+    id.original_position = Some(1);
+    let mut name = existing_pk_column("name", "varchar(500)", false, false);
+    name.is_nullable = true;
+    name.original.as_mut().unwrap().is_nullable = true;
+    name.original_position = Some(2);
+    let columns = [day, id, name];
+    let context = StarRocksAlterOptions {
+        server_version: Some("3.5.0".into()), model: Some("duplicate".into()),
+        key_columns: vec!["day".into(), "id".into()],
+        partition_columns: vec!["day".into(), "id".into()],
+        column_names: vec!["day".into(), "id".into(), "name".into()],
+        sort_columns: Some(vec!["id".into(), "day".into()]),
+        position_column_order: true, ..Default::default()
+    };
+    // Metadata's primary-key flag is false for Duplicate Key tables: use DDL key membership.
+    // Keys may swap positions, but values cannot precede or split the key prefix.
+    let options = structure_change_options(DatabaseType::StarRocks, None, "test4", [1, 0, 2].map(|index| columns[index].clone()).to_vec());
+    let result = build_table_structure_change_sql_with_context(options, Some(context.clone()));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec!["ALTER TABLE `test4` MODIFY COLUMN `id` varchar(255) KEY NOT NULL COMMENT '' FIRST;"]);
+    for order in [[0, 2, 1], [2, 1, 0], [1, 2, 0]] {
+        let options = structure_change_options(DatabaseType::StarRocks, None, "test4", order.map(|index| columns[index].clone()).to_vec());
+        let result = build_table_structure_change_sql_with_context(options, Some(context.clone()));
+        assert!(result.statements.is_empty());
+        assert!(result.warnings.iter().any(|warning| warning.contains("must precede all value columns")));
+    }
+}
+
+#[test]
+fn starrocks_reorders_around_generated_partition_sources_in_both_directions() {
+    let mut day = existing_pk_column("day", "datetime", false, false);
+    day.is_nullable = true;
+    day.original.as_mut().unwrap().is_nullable = true;
+    let id = existing_pk_column("id", "varchar(255)", false, false);
+    let name = existing_pk_column("name", "varchar(500)", false, false);
+    for day_first in [false, true] {
+        let mut columns = if day_first { vec![day.clone(), id.clone(), name.clone()] } else { vec![id.clone(), day.clone(), name.clone()] };
+        for (index, column) in columns.iter_mut().enumerate() { column.original_position = Some(index); }
+        let names: Vec<_> = columns.iter().map(|column| column.name.clone()).collect();
+        let context = StarRocksAlterOptions {
+            server_version: Some("3.5.0".into()), model: Some("duplicate".into()),
+            key_columns: names[..2].to_vec(), partition_columns: vec!["day".into(), "id".into()],
+            partition_expression_columns: vec!["DAY".into()],
+            column_names: names, sort_columns: Some(vec!["id".into(), "day".into()]),
+            position_column_order: true, ..Default::default()
+        };
+        columns.swap(0, 1);
+        let options = structure_change_options(DatabaseType::StarRocks, None, "test4", columns);
+        let result = build_table_structure_change_sql_with_context(options.clone(), Some(context.clone()));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let placement = if day_first { "FIRST" } else { "AFTER `day`" };
+        assert_eq!(result.statements, vec![format!("ALTER TABLE `test4` MODIFY COLUMN `id` varchar(255) KEY NOT NULL COMMENT '' {placement};")]);
+
+        let mut blocked = context;
+        blocked.partition_expression_columns.push("id".into());
+        let result = build_table_structure_change_sql_with_context(options, Some(blocked));
+        assert!(result.statements.is_empty());
+        assert!(result.warnings.iter().any(|warning| warning.contains("partition-expression source")));
+    }
+}
+
+#[test]
+fn starrocks_reorder_preserves_renames_but_blocks_definition_changes() {
+    let (mut options, context) = starrocks_reorder_fixture();
+    options.columns[1].name = "new`name".into();
+    let result = build_table_structure_change_sql_with_context(options.clone(), Some(context.clone()));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec![
+        "ALTER TABLE `test4` RENAME COLUMN `name` TO `new``name`;",
+        "ALTER TABLE `test4` MODIFY COLUMN `new``name` varchar(500) NOT NULL COMMENT '' AFTER `id`;"
+    ]);
+    options.columns[1].data_type = "varchar(600)".into();
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.iter().any(|warning| warning.contains("separately")));
+}
+
+#[test]
+fn starrocks_reorder_is_opt_in_and_unchanged_order_is_clean() {
+    let (options, mut context) = starrocks_reorder_fixture();
+    context.position_column_order = false;
+    let result = build_table_structure_change_sql_with_context(options.clone(), Some(context.clone()));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.is_empty());
+    context.position_column_order = true;
+    let mut options = options;
+    options.columns.sort_by_key(|column| column.original_position);
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.is_empty());
+}
+
+
+#[test]
+fn starrocks_position_moves_preserve_protected_anchors_and_column_definitions() {
+    let names = ["id", "x", "bucket", "y", "z"];
+    let mut columns: Vec<_> = names.iter().enumerate().map(|(index, name)| {
+        let mut column = existing_pk_column(name, "varchar(500)", false, false);
+        column.original_position = Some(index); column
+    }).collect();
+    let desired = [0, 4, 2, 3, 1].map(|index| columns[index].clone()).to_vec();
+    let options = structure_change_options(DatabaseType::StarRocks, None, "t", desired);
+    let context = StarRocksAlterOptions { model: Some("duplicate".into()), key_columns: vec!["id".into()],
+        distribution_columns: vec!["bucket".into()], column_names: names.iter().map(|name| name.to_string()).collect(),
+        position_column_order: true, ..Default::default() };
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec!["ALTER TABLE `t` MODIFY COLUMN `z` varchar(500) NOT NULL COMMENT '' AFTER `id`, MODIFY COLUMN `x` varchar(500) NOT NULL COMMENT '' AFTER `y`;"]);
+    columns.swap(0, 2);
+    let options = structure_change_options(DatabaseType::StarRocks, None, "t", columns);
+    let context = StarRocksAlterOptions { model: Some("duplicate".into()), distribution_columns: vec!["id".into(), "bucket".into()],
+        column_names: names.iter().map(|name| name.to_string()).collect(), position_column_order: true, ..Default::default() };
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.statements.is_empty());
+    assert!(!result.warnings.is_empty());
+}
+
+
+#[test]
+fn starrocks_legacy_order_by_reordering_is_rejected() {
+    let (options, mut context) = starrocks_reorder_fixture();
+    context.reorder_columns = true;
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.iter().any(|warning| warning.contains("legacy")));
+}
+
+#[test]
+fn starrocks_sort_keys_are_explicit_and_separate_from_column_order() {
+    let (mut options, mut context) = starrocks_reorder_fixture();
+    options.columns.sort_by_key(|column| column.original_position);
+    context.sort_column_names = Some(vec!["id".into(), "name".into()]);
+    let result = build_table_structure_change_sql_with_context(options.clone(), Some(context.clone()));
+    assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+    assert_eq!(result.statements, vec!["ALTER TABLE `test4` ORDER BY (`id`, `name`);"]);
+    options.columns.swap(1, 2);
+    let result = build_table_structure_change_sql_with_context(options, Some(context));
+    assert!(result.statements.is_empty());
+    assert!(result.warnings.iter().any(|warning| warning.contains("separately")));
+}
+
+#[test]
+fn starrocks_sort_key_validation_guards_models_types_versions_and_full_schema() {
+    for case in ["all", "empty", "repeat", "missing", "old", "primary_decimal", "aggregate_nonkey", "unknown"] {
+        let (mut options, mut context) = starrocks_reorder_fixture();
+        options.columns.sort_by_key(|column| column.original_position);
+        context.position_column_order = false;
+        context.sort_column_names = Some(vec!["id".into(), "name".into()]);
+        match case {
+            "all" => context.sort_column_names = Some(vec!["id".into(), "name".into(), "price".into()]),
+            "empty" => context.sort_column_names = Some(vec![]),
+            "repeat" => context.sort_column_names = Some(vec!["id".into(), "id".into()]),
+            "missing" => context.sort_column_names = Some(vec!["absent".into()]),
+            "old" => context.server_version = Some("3.2.9".into()),
+            "primary_decimal" => { context.model = Some("primary".into()); context.sort_column_names = Some(vec!["price".into()]); },
+            "aggregate_nonkey" => context.model = Some("aggregate".into()),
+            "unknown" => context.model = None,
+            _ => unreachable!(),
+        }
+        let result = build_table_structure_change_sql_with_context(options, Some(context));
+        assert!(result.statements.is_empty(), "{case} {:?}", result.statements);
+        assert!(!result.warnings.is_empty(), "{case}");
+    }
+    for model in ["primary", "aggregate", "unique"] {
+        let (mut options, mut context) = starrocks_reorder_fixture();
+        options.columns.sort_by_key(|column| column.original_position);
+        context.position_column_order = false;
+        context.model = Some(model.into());
+        context.sort_column_names = Some(vec!["id".into()]);
+        let result = build_table_structure_change_sql_with_context(options, Some(context));
+        assert!(result.warnings.is_empty(), "{model} {:?}", result.warnings);
+        assert_eq!(result.statements, vec!["ALTER TABLE `test4` ORDER BY (`id`);"]);
     }
 }

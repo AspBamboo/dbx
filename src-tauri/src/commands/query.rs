@@ -746,8 +746,9 @@ pub fn build_view_ddl_sql(input: dbx_core::object_source_sql::BuildViewDdlInput)
 #[tauri::command]
 pub fn build_table_structure_change_sql(
     options: dbx_core::table_structure_sql::TableStructureSqlOptions,
+    starrocks: Option<dbx_core::table_structure_sql::StarRocksAlterOptions>,
 ) -> Result<dbx_core::table_structure_sql::TableStructureSqlResult, String> {
-    Ok(dbx_core::table_structure_sql::build_table_structure_change_sql(options))
+    Ok(dbx_core::table_structure_sql::build_table_structure_change_sql_with_context(options, starrocks))
 }
 
 #[tauri::command]
