@@ -113,6 +113,13 @@ impl AlterTableDialect for StarRocksAlter {
                 {
                     warnings.push("New StarRocks columns cannot change keys or use MySQL extra properties.".into());
                 }
+                // CREATE accepts UUID generators, but ADD cannot backfill these varying defaults.
+                static UUID_DEFAULT: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+                    regex::Regex::new(r"(?i)^\s*\(*\s*uuid(?:_numeric)?\s*\(\s*\)\s*\)*\s*$").unwrap()
+                });
+                if UUID_DEFAULT.is_match(&column.default_value) {
+                    warnings.push(format!("StarRocks ADD COLUMN '{}' does not support uuid() or uuid_numeric() defaults. Use a literal or NULL; UUID defaults are only available when creating a table.", column.name));
+                }
                 changes.push(format!("ADD COLUMN {}", definition(column, false)));
                 continue;
             };
@@ -126,9 +133,13 @@ impl AlterTableDialect for StarRocksAlter {
                 changes.push(format!("DROP COLUMN {}", quote(&original.name)));
                 continue;
             }
+            let default_changed = normalize_default(Some(&column.default_value)) != original_default(column);
+            if default_changed {
+                warnings.push(format!("StarRocks cannot change the default value of existing column '{}'. Set defaults when creating a table or adding a column.", original.name));
+            }
             let definition_changed = !column.data_type.trim().eq_ignore_ascii_case(original.data_type.trim())
                 || column.is_nullable != original.is_nullable
-                || normalize_default(Some(&column.default_value)) != original_default(column);
+                || default_changed;
             let comment_changed = clean(&column.comment) != original_comment(column);
             if column.name != original.name {
                 if !at_least((3, 3, 2)) {

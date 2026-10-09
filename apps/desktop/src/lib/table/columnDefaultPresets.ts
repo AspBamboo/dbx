@@ -10,6 +10,7 @@ export interface ColumnDefaultPresetContext {
   dialect: string;
   serverVersion?: string;
   unsetLabel: string;
+  isCreateMode?: boolean;
 }
 type DefaultColumn = Pick<EditableStructureColumn, "dataType" | "isNullable" | "isPrimaryKey" | "extra">;
 type DefaultPresetProvider = (column: DefaultColumn, context: ColumnDefaultPresetContext) => DefaultValuePreset[];
@@ -30,7 +31,8 @@ function starRocksDefaultPresets(column: DefaultColumn, context: ColumnDefaultPr
   const base = column.dataType.split(/[<(]/)[0]!.trim().toLowerCase();
   if (column.extra?.autoIncrement || base === "hll" || base === "bitmap") return result;
   if (column.isNullable && !column.isPrimaryKey) result.push(...presets("NULL"));
-  const functions = getStarRocksCapabilities(context.serverVersion).defaultFunctions;
+  // ADD COLUMN cannot backfill per-row UUID expressions.
+  const functions = context.isCreateMode === true && getStarRocksCapabilities(context.serverVersion).defaultFunctions;
   if (/^(tinyint|smallint|int|integer|bigint|largeint|float|double|decimal|decimalv2|decimal32|decimal64|decimal128|decimal256)$/.test(base)) {
     result.push(...presets("'0'", "'1'"));
     if (base === "largeint" && functions) result.push(...presets("(uuid_numeric())"));

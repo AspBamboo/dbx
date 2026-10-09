@@ -29,7 +29,7 @@ describe("StarRocks ALTER metadata", () => {
   });
   it("separates StarRocks editing capabilities from MySQL and gates rename versions", () => {
     const caps = getTableStructureCapabilities("starrocks", "mysql", "3.5.0");
-    expect(caps).toMatchObject({ renameColumn: true, alterDefault: true, alterType: true, alterPrimaryKey: false, addPrimaryKey: false, createIndex: false, foreignKey: false, reorderColumn: false });
+    expect(caps).toMatchObject({ renameColumn: true, alterDefault: false, alterType: true, alterPrimaryKey: false, addPrimaryKey: false, createIndex: false, foreignKey: false, reorderColumn: false });
     expect(getTableStructureCapabilities("starrocks", "starrocks", "3.3.1").renameColumn).toBe(false);
     expect(getTableStructureCapabilities("starrocks", "starrocks", "3.3.2").renameColumn).toBe(true);
     expect(getTableStructureCapabilities("starrocks").renameColumn).toBe(false);

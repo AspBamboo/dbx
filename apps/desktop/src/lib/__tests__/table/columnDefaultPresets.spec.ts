@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { getColumnDefaultValuePresets } from "@/lib/table/columnDefaultPresets";
 
-const context = { databaseType: "starrocks", dialect: "mysql", serverVersion: "3.5.0", unsetLabel: "No default" };
+const context = { databaseType: "starrocks", dialect: "mysql", serverVersion: "3.5.0", unsetLabel: "No default", isCreateMode: true };
 const column = (dataType: string) => ({ dataType, isNullable: true, isPrimaryKey: false, extra: {} });
 const values = (dataType: string) => getColumnDefaultValuePresets(column(dataType), context).map((p) => p.value);
 
@@ -51,6 +51,16 @@ describe("StarRocks default preset provider", () => {
 
   it.each([undefined, "5.1.0", "2.0.0"])("does not offer unverified UUID defaults on %s", (serverVersion) => {
     expect(getColumnDefaultValuePresets(column("varchar(100)"), { ...context, serverVersion }).map((p) => p.value)).not.toContain("(uuid())");
+  });
+
+  it.each([false, undefined])("omits UUID expressions outside create mode (%s), preserving ADD literals and timestamp", (isCreateMode) => {
+    const addContext = { ...context, isCreateMode };
+    for (const type of ["varchar(255)", "string", "largeint"]) {
+      expect(getColumnDefaultValuePresets(column(type), addContext).map((p) => p.value)).not.toEqual(expect.arrayContaining([expect.stringMatching(/uuid/)]));
+    }
+    expect(getColumnDefaultValuePresets(column("varchar(255)"), addContext).map((p) => p.value)).toEqual(["", "NULL", "''"]);
+    expect(getColumnDefaultValuePresets(column("largeint"), addContext).map((p) => p.value)).toEqual(["", "NULL", "'0'", "'1'"]);
+    expect(getColumnDefaultValuePresets(column("datetime"), addContext).map((p) => p.value)).toEqual(["", "NULL", "CURRENT_TIMESTAMP"]);
   });
 
   it("preserves MySQL and PostgreSQL presets", () => {

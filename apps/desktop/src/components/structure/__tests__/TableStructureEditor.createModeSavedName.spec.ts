@@ -187,9 +187,9 @@ vi.mock("@/components/ui/dropdown-menu", async () => {
   const Div = defineComponent({
     inheritAttrs: false,
     setup:
-      (_props, { attrs }) =>
+      (_props, { attrs, slots }) =>
       () =>
-        h("div", attrs),
+        h("div", attrs, mocks.renderColumnRows ? slots.default?.() : undefined),
   });
   return { DropdownMenu: Div, DropdownMenuCheckboxItem: Div, DropdownMenuContent: Div, DropdownMenuItem: Div, DropdownMenuTrigger: Div };
 });
@@ -754,6 +754,60 @@ it.each([false, true])("refreshes finished StarRocks jobs only without a draft (
       await vi.waitFor(() => expect(mocks.getColumns).toHaveBeenCalled());
       expect(latestDraft?.columns?.[1]?.name).toBe("name");
     }
+  } finally {
+    mocks.connection.db_type = previousType;
+  }
+});
+
+it.each(["existing", "added", "create"].flatMap((mode) => ["decimal(7,0)", "varchar(255)"].map((dataType) => ({ mode, dataType }))))("keeps StarRocks defaults valid for $mode $dataType", async ({ mode, dataType }) => {
+  mocks.renderColumnRows = true;
+  const previousType = mocks.connection.db_type;
+  mocks.connection.db_type = "starrocks";
+  mocks.loadObjectDdl.mockResolvedValue({ ddl: "CREATE TABLE `t` (`id` INT, `price` DECIMAL(7,0)) ENGINE=OLAP DUPLICATE KEY(`id`) DISTRIBUTED BY RANDOM", cacheStatus: "remote" });
+  try {
+    const root = document.createElement("div");
+    document.body.append(root);
+    const app = createApp(TableStructureEditor, {
+      connectionId: mocks.connection.id,
+      database: "test",
+      tableName: mode === "create" ? "" : "t",
+      draft: {
+        dirty: true,
+        activeTab: "columns",
+        newTableName: "t",
+        tableComment: "",
+        originalTableComment: "",
+        columns: [
+          {
+            id: "price",
+            name: "price",
+            dataType,
+            isNullable: true,
+            defaultValue: "'0'",
+            comment: "",
+            isPrimaryKey: false,
+            extra: {},
+            markedForDrop: false,
+            original: mode === "existing" ? { name: "price", data_type: dataType, is_nullable: true, is_primary_key: false, column_default: "'0'" } : undefined,
+          },
+        ],
+        indexes: [],
+        foreignKeys: [],
+        triggers: [],
+        initialized: true,
+      },
+    });
+    mountedApps.push(app);
+    app.mount(root);
+    await vi.waitFor(() => expect(root.querySelector(".structure-column-default-value input")).not.toBeNull());
+    await settle();
+    const input = root.querySelector<HTMLInputElement>(".structure-column-default-value input")!;
+    const presets = root.querySelector<HTMLButtonElement>('button[aria-label="structureEditor.defaultValuePresets"]')!;
+    expect(input.value).toBe("'0'");
+    expect(input.disabled).toBe(mode === "existing");
+    expect(presets.disabled).toBe(mode === "existing");
+    const expected = dataType.startsWith("decimal") ? ["'0'", "'1'"] : mode === "create" ? ["''", "(uuid())"] : ["''"];
+    expect(Array.from(root.querySelectorAll(".structure-column-default-value code"), (node) => node.textContent)).toEqual(["structureEditor.unsetDefault", "NULL", ...expected]);
   } finally {
     mocks.connection.db_type = previousType;
   }

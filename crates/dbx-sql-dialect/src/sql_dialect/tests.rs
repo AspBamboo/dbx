@@ -1,3 +1,4 @@
+use super::identifiers::quote_gaussdb_jdbc_identifier;
 use super::*;
 use crate::models::connection::DatabaseType;
 
@@ -16,6 +17,7 @@ fn transfer_identifier_policy_preserves_legacy_output() {
 
 #[test]
 fn quotes_identifiers_by_database_type() {
+    assert_eq!(quote_table_identifier(Some(DatabaseType::Nebula), "tag`name"), "`tag\\`name`");
     assert_eq!(quote_table_identifier(Some(DatabaseType::Mysql), "user`name"), "`user``name`");
     assert_eq!(quote_table_identifier(Some(DatabaseType::ClickHouse), "user`name"), "`user``name`");
     assert_eq!(quote_table_identifier(Some(DatabaseType::Doris), "user`name"), "`user``name`");
@@ -47,6 +49,29 @@ fn quotes_identifiers_by_database_type() {
     assert_eq!(quote_table_identifier(Some(DatabaseType::Argo), "user`name"), "`user``name`");
     assert_eq!(quote_transfer_identifier("user`name", &DatabaseType::Argo), "`user``name`");
     assert!(is_schema_aware(DatabaseType::Argo));
+}
+
+#[test]
+fn builds_nebula_tag_and_edge_queries() {
+    let tag = build_table_data_select_sql(TableDataSelectSqlOptions {
+        database_type: Some(DatabaseType::Nebula),
+        table_name: "player".into(),
+        table_type: Some("TABLE".into()),
+        columns: vec!["name".into()],
+        limit: Some(20),
+        ..Default::default()
+    });
+    assert_eq!(tag, "MATCH (v:`player`) RETURN id(v) AS `_vid`, v.`player`.`name` AS `name` LIMIT 20;");
+
+    let edge = build_table_data_select_sql(TableDataSelectSqlOptions {
+        database_type: Some(DatabaseType::Nebula),
+        table_name: "serve".into(),
+        table_type: Some("VIEW".into()),
+        columns: vec!["start_year".into()],
+        limit: Some(10),
+        ..Default::default()
+    });
+    assert_eq!(edge, "MATCH ()-[e:`serve`]->() RETURN src(e) AS `_src`, dst(e) AS `_dst`, rank(e) AS `_rank`, e.`start_year` AS `start_year` LIMIT 10;");
 }
 
 /// Spanner databases are created in one of two immutable dialects. The connected
@@ -1010,6 +1035,39 @@ fn builds_postgres_table_data_large_value_previews() {
 }
 
 #[test]
+fn builds_db2_table_data_large_value_previews_with_bounded_substr() {
+    let sql = build_table_data_select_sql(TableDataSelectSqlOptions {
+        database_type: Some(DatabaseType::Db2),
+        schema: Some("DB2INST1".to_string()),
+        table_name: "large_rows".to_string(),
+        primary_keys: vec!["id".to_string()],
+        columns: vec!["id".to_string(), "doc".to_string(), "raw_value".to_string()],
+        column_types: vec!["integer".to_string(), "clob".to_string(), "blob".to_string()],
+        large_value_preview_size: Some(4096),
+        limit: Some(100),
+        ..Default::default()
+    });
+
+    // DB2 的 SUBSTR 第三参数越界会报 SQL0138N，故用 CASE WHEN LENGTH(..) 把预览长度
+    // 夹在实际长度内：CLOB → 文本预览、BLOB → 二进制预览，都不对短值报错。
+    assert!(
+        sql.contains(
+            "SUBSTR(\"doc\", 1, CASE WHEN LENGTH(\"doc\") >= 4097 THEN 4097 ELSE LENGTH(\"doc\") END) AS \"doc\""
+        ),
+        "clob preview sql: {sql}"
+    );
+    assert!(sql.contains("'T:4096' AS "), "clob marker sql: {sql}");
+    assert!(
+        sql.contains("SUBSTR(\"raw_value\", 1, CASE WHEN LENGTH(\"raw_value\") >= 4097 THEN 4097 ELSE LENGTH(\"raw_value\") END) AS \"raw_value\""),
+        "blob preview sql: {sql}"
+    );
+    assert!(sql.contains("'B:4096' AS "), "blob marker sql: {sql}");
+    // 主键列不做预览，且不得生成裸 SUBSTR(col,1,n)（会越界报错）
+    assert!(!sql.contains("SUBSTR(\"id\""), "pk should not be previewed: {sql}");
+    assert!(!sql.contains("SUBSTR(\"doc\", 1, 4097)"), "must not emit unbounded substr: {sql}");
+}
+
+#[test]
 fn preserves_postgres_array_types_in_large_value_previews() {
     let sql = build_table_data_select_sql(TableDataSelectSqlOptions {
         database_type: Some(DatabaseType::Postgres),
@@ -1693,4 +1751,58 @@ fn oracle_view_later_pages_keep_rownum_pagination() {
 fn normalizes_where_input_with_multibyte_identifier_prefix() {
     assert_eq!(normalize_where_input(Some("`客户名称` = '示例客户'")), "`客户名称` = '示例客户'");
     assert_eq!(normalize_where_input(Some("WHERE `客户名称` = '示例客户';")), "`客户名称` = '示例客户'");
+}
+
+// Grid saves re-quote the table identity carried by the query result. For
+// PostgreSQL-family engines reached through an agent-reported identifier quote,
+// `quote_gaussdb_jdbc_identifier` only leaves all-lower-case identifiers
+// unquoted, so a folded (`mss_check_sales_item`) write resolves while the
+// query's original casing (`term."MSS_CHECK_SALES_ITEM"`) fails with
+// `relation ... does not exist` on a lower-case-stored table (issue #10567).
+// The frontend folds unquoted SQL-text identifiers before they reach this
+// layer; these assertions lock the quoting contract that makes that fix work.
+#[test]
+fn postgres_family_table_data_quoting_resolves_folded_identifiers() {
+    let quote = Some("\"".to_string());
+    assert_eq!(quote_gaussdb_jdbc_identifier("mss_check_sales_item", "\""), "mss_check_sales_item");
+    assert_eq!(quote_gaussdb_jdbc_identifier("MSS_CHECK_SALES_ITEM", "\""), "\"MSS_CHECK_SALES_ITEM\"");
+    assert_eq!(quote_gaussdb_jdbc_identifier("term", "\""), "term");
+
+    assert_eq!(
+        table_data_qualified_table_name(
+            Some(DatabaseType::Postgres),
+            Some("term"),
+            "mss_check_sales_item",
+            quote.as_deref()
+        ),
+        "term.mss_check_sales_item"
+    );
+    assert_eq!(
+        table_data_qualified_table_name(
+            Some(DatabaseType::Postgres),
+            Some("term"),
+            "MSS_CHECK_SALES_ITEM",
+            quote.as_deref()
+        ),
+        "term.\"MSS_CHECK_SALES_ITEM\""
+    );
+    assert_eq!(
+        table_data_qualified_table_name(
+            Some(DatabaseType::Gaussdb),
+            Some("term"),
+            "mss_check_sales_item",
+            quote.as_deref()
+        ),
+        "term.mss_check_sales_item"
+    );
+    // Engines outside the GaussDB/PG identifier-quote path quote both parts.
+    assert_eq!(
+        table_data_qualified_table_name(
+            Some(DatabaseType::Jdbc),
+            Some("term"),
+            "mss_check_sales_item",
+            quote.as_deref()
+        ),
+        "\"term\".\"mss_check_sales_item\""
+    );
 }

@@ -27,14 +27,15 @@ import {
 import { createSidebarLabelMatcher } from "@/lib/sidebar/sidebarSearch";
 import { collectSidebarRegexIndexScopes, resolveSidebarRemoteSearchQuery, resolveSidebarSearchDispatchMode, shouldRestoreTrackedSidebarSearchTargetsInRegexMode } from "@/lib/sidebar/sidebarRegexSearchIndex";
 import { needsSidebarObjectGroupDiscovery } from "@/lib/sidebar/sidebarSearchDiscovery";
+import { isSidebarSearchPrunedDatabaseNode, resolveSidebarSearchDatabaseScope } from "@/lib/sidebar/sidebarSearchDatabaseScope";
 import { createSidebarSearchExpansionState } from "@/lib/sidebar/sidebarSearchExpansionState";
 import { createSidebarSearchLoadingTracker } from "@/lib/sidebar/sidebarSearchLoadingTracker";
-import { isCancelSearchShortcut, isCopySidebarSelectionShortcut, isEditSidebarConnectionShortcut, isPasteSidebarSelectionShortcut, isViewTableDdlShortcut } from "@/lib/editor/keyboardShortcuts";
+import { isCancelSearchShortcut, isCopySidebarSelectionShortcut, isDisconnectSidebarConnectionShortcut, isEditSidebarConnectionShortcut, isPasteSidebarSelectionShortcut, isViewTableDdlShortcut } from "@/lib/editor/keyboardShortcuts";
 import { sidebarNodeSupportsDdlView } from "@/lib/sidebar/sidebarTreeDdlShortcut";
 import { objectSourceTargetForTreeNode } from "@/lib/sidebar/treeNodeClick";
 import { supportsTypeObjectSource } from "@/lib/database/databaseObjectCapabilities";
 import { copyToClipboard } from "@/lib/common/clipboard";
-import { connectionPasteTargetGroupId, copySelectedConnectionsToClipboards, selectedConnectionEditTarget } from "@/lib/sidebar/sidebarConnectionSelection";
+import { connectionPasteTargetGroupId, copySelectedConnectionsToClipboards, selectedConnectionDisconnectTargets, selectedConnectionEditTarget } from "@/lib/sidebar/sidebarConnectionSelection";
 import { formatSidebarTableCopyText } from "@/lib/sidebar/sidebarTableNameCopy";
 import { pruneTreeSelectionToVisibleNodeIds } from "@/lib/sidebar/sidebarTreeSelection";
 import { isEditableSidebarTypeSearchTarget, sidebarTypeSearchNextQuery } from "@/lib/sidebar/sidebarTypeSearch";
@@ -387,9 +388,16 @@ async function loadSidebarSearchTargets(query: string, preservesNodeSubtree?: (n
   } while (deferredSearchQuery.value === query && store.sidebarSearchQuery === query);
 }
 
-function collectExpandedObjectSearchTargets(node: TreeNode, tasks: SidebarSearchTask[], refreshedNodeIds?: Set<string>, preservesNodeSubtree?: (node: TreeNode) => boolean, ancestorPreservesSearchSubtree = false, scheduledNodeIds?: Set<string>) {
+function collectExpandedObjectSearchTargets(node: TreeNode, tasks: SidebarSearchTask[], refreshedNodeIds?: Set<string>, preservesNodeSubtree?: (node: TreeNode) => boolean, ancestorPreservesSearchSubtree = false, scheduledNodeIds?: Set<string>, databaseScope?: ReadonlySet<string> | null) {
   const preservesSearchSubtree = ancestorPreservesSearchSubtree || (!!refreshedNodeIds && !!preservesNodeSubtree?.(node));
   if (refreshedNodeIds && node.type === "connection" && node.connectionId) {
+    // 数据库级节点只有被用户真正打开（树已加载或被打开的页签引用，与侧栏
+    // 「打开」高亮同口径）才参与自动搜索；一个都没打开时退回全库搜索。
+    databaseScope = resolveSidebarSearchDatabaseScope(node, {
+      enabled: settingsStore.editorSettings.sidebarSearchOpenedDatabasesOnly,
+      isChildrenLoaded: store.isTreeNodeChildrenLoaded,
+      openDatabaseKeys: queryStore.openDatabaseKeys,
+    });
     const connectionIsConnected = store.connectedIds.has(node.connectionId);
     if (connectionIsConnected && (!scheduledNodeIds || !scheduledNodeIds.has(node.id))) {
       const connectionId = node.connectionId;
@@ -400,6 +408,7 @@ function collectExpandedObjectSearchTargets(node: TreeNode, tasks: SidebarSearch
     // 断开或连不上的连接直接跳过，后台搜索不会因此弹出凭据输入或写入整段连接错误。
     if (!connectionIsConnected || node.connectionId !== store.activeConnectionId) return;
   }
+  if (refreshedNodeIds && databaseScope && isSidebarSearchPrunedDatabaseNode(node, databaseScope)) return;
   if (refreshedNodeIds && isSimpleObjectSearchParent(node)) {
     if (!scheduledNodeIds || !scheduledNodeIds.has(node.id)) {
       scheduledNodeIds?.add(node.id);
@@ -460,7 +469,7 @@ function collectExpandedObjectSearchTargets(node: TreeNode, tasks: SidebarSearch
   }
   if (node.children) {
     for (const child of node.children) {
-      collectExpandedObjectSearchTargets(child, tasks, refreshedNodeIds, preservesNodeSubtree, preservesSearchSubtree, scheduledNodeIds);
+      collectExpandedObjectSearchTargets(child, tasks, refreshedNodeIds, preservesNodeSubtree, preservesSearchSubtree, scheduledNodeIds, databaseScope);
     }
   }
 }
@@ -1754,7 +1763,7 @@ async function ensureTreeLoadedForTarget(target: ActiveTabSidebarTarget, opts?: 
         await store.loadMongoDatabases(connId);
       } else if (config.db_type === "dynamodb") {
         await store.loadDynamoDbTables(connId);
-      } else if (config.db_type === "elasticsearch" || config.db_type === "easysearch" || config.db_type === "meilisearch" || config.db_type === "solr") {
+      } else if (config.db_type === "elasticsearch" || config.db_type === "easysearch" || config.db_type === "meilisearch" || config.db_type === "solr" || config.db_type === "couchdb") {
         await store.loadElasticsearchIndices(connId);
       } else if (config.db_type === "qdrant" || config.db_type === "milvus" || config.db_type === "weaviate" || config.db_type === "chromadb") {
         await store.loadVectorCollections(connId);
@@ -1934,13 +1943,32 @@ function onNodeToggled(node: TreeNode, expanded: boolean) {
   syncSidebarTreeNodeExpansion(store.treeNodes, node, expanded);
 }
 
+let contextMenuRequest = 0;
 function openSidebarContextMenu(event: MouseEvent, node: TreeNode, openContextMenu: (event: MouseEvent, itemsOverride?: ContextMenuItem[]) => void) {
+  event.preventDefault();
+  event.stopPropagation();
+  const request = ++contextMenuRequest;
   const items = sidebarTreeRuntime.buildContextMenu(node);
-  sidebarContextMenuTarget.value = createSidebarActionTarget(node);
-  sidebarContextMenuItems.value = items;
-  // Pass the current row's resolved menu atomically. Waiting for the items prop
-  // to flush would let the singleton menu briefly reuse the previous row menu.
-  openContextMenu(event, items);
+  const resolved = sidebarTreeRuntime.resolveContextMenu(node, items);
+  const show = (menuItems: ContextMenuItem[]) => {
+    if (request !== contextMenuRequest) return;
+    sidebarContextMenuTarget.value = createSidebarActionTarget(node);
+    sidebarContextMenuItems.value = menuItems;
+    // Pass the current row's resolved menu atomically, including async plugin items.
+    openContextMenu(event, menuItems);
+  };
+  if (resolved instanceof Promise) {
+    const cancelPending = () => {
+      contextMenuRequest += 1;
+    };
+    document.addEventListener("pointerdown", cancelPending, { capture: true, once: true });
+    void resolved
+      .then(show)
+      .catch(() => show(items))
+      .finally(() => {
+        document.removeEventListener("pointerdown", cancelPending, true);
+      });
+  } else show(resolved);
 }
 
 function openSidebarDangerDialog(request: SidebarDangerDialogRequest) {
@@ -2379,6 +2407,13 @@ function onWindowKeydown(event: KeyboardEvent) {
       }
       return;
     }
+    if (sidebarShortcutTargetAllowsAppShortcut(event.target) && isDisconnectConnectionShortcut(event)) {
+      if (requestSelectedConnectionDisconnect()) {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+      return;
+    }
     if (sidebarShortcutTargetAllowsAppShortcut(event.target) && isCopySidebarSelectionShortcut(event, settingsStore.editorSettings.shortcuts)) {
       if (copySelectedSidebarNames()) {
         event.preventDefault();
@@ -2439,6 +2474,10 @@ function isEditConnectionShortcut(event: KeyboardEvent): boolean {
   return isEditSidebarConnectionShortcut(event, settingsStore.editorSettings.shortcuts);
 }
 
+function isDisconnectConnectionShortcut(event: KeyboardEvent): boolean {
+  return isDisconnectSidebarConnectionShortcut(event, settingsStore.editorSettings.shortcuts);
+}
+
 function requestSelectedConnectionEdit(): boolean {
   const selectedNodeId = store.selectedTreeNodeId;
   const currentNode = selectedNodeId ? flatTreeIndex.value.nodeById.get(selectedNodeId) : null;
@@ -2447,6 +2486,26 @@ function requestSelectedConnectionEdit(): boolean {
   if (!editTarget) return false;
   store.startEditing(editTarget.connectionId);
   return true;
+}
+
+function requestSelectedConnectionDisconnect(): boolean {
+  const selectedNodeId = store.selectedTreeNodeId;
+  const currentNode = selectedNodeId ? flatTreeIndex.value.nodeById.get(selectedNodeId) : null;
+  if (!currentNode) return false;
+  const targets = selectedConnectionDisconnectTargets(currentNode, selectedSidebarNodesInVisibleOrder());
+  const connectedTargets = targets.filter((target) => store.connectedIds.has(target.connectionId));
+  if (connectedTargets.length > 0) {
+    const connectionIds = connectedTargets.map((target) => target.connectionId);
+    void disconnectSidebarConnections(connectionIds, (connectionId) => store.disconnect(connectionId)).then((result) => {
+      if (result.succeeded > 0 && result.failed === 0) {
+        toast(connectionIds.length > 1 ? t("connection.disconnectedSelected", { count: connectionIds.length }) : t("connection.disconnected"), 2000);
+      } else if (result.failed > 0) {
+        toast(t("connection.disconnectSelectedPartial", { succeeded: result.succeeded, failed: result.failed }), 5000);
+      }
+    });
+    return true;
+  }
+  return false;
 }
 
 function copySelectedSidebarNames(): boolean {
@@ -2862,6 +2921,7 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes, locateTabInSid
       :title="sidebarDangerDialogRequest.title"
       :message="sidebarDangerDialogRequest.message"
       :sql="sidebarDangerDialogRequest.sql"
+      :copy-sql="sidebarDangerDialogRequest.copySql"
       :details="sidebarDangerDialogRequest.details"
       :details-text="sidebarDangerDialogRequest.detailsText"
       :confirm-label="sidebarDangerDialogRequest.confirmLabel"
@@ -2874,9 +2934,9 @@ defineExpose({ focusSearch, createNewGroup, collapseAllTreeNodes, locateTabInSid
       @cancel-running="cancelSidebarDangerDialogRunning"
     >
       <template #options>
-        <div v-if="sidebarDangerDialogConfirming && sidebarDangerDialogRequest.progress" class="mb-3 rounded-md border bg-muted/20 px-3 py-2.5">
+        <div v-if="sidebarDangerDialogRequest.progress" class="mb-3 rounded-md border bg-muted/20 px-3 py-2.5">
           <div class="mb-1.5 flex items-center justify-between text-xs tabular-nums text-muted-foreground">
-            <span>{{ sidebarDangerDialogRequest.progress.completed }} / {{ sidebarDangerDialogRequest.progress.total }}</span>
+            <span>{{ sidebarDangerDialogRequest.progress.phase === "preparing" ? t("databaseEmpty.preparing", { database: sidebarDangerDialogRequest.target.database }) : "" }} {{ sidebarDangerDialogRequest.progress.completed }} / {{ sidebarDangerDialogRequest.progress.total }}</span>
             <span>{{ Math.round((sidebarDangerDialogRequest.progress.completed / sidebarDangerDialogRequest.progress.total) * 100) }}%</span>
           </div>
           <div class="h-2 overflow-hidden rounded-full bg-muted" role="progressbar" :aria-valuemin="0" :aria-valuemax="sidebarDangerDialogRequest.progress.total" :aria-valuenow="sidebarDangerDialogRequest.progress.completed">

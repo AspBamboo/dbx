@@ -4784,6 +4784,57 @@ fn builds_dameng_alter_table_change_primary_key() {
 }
 
 #[test]
+fn builds_sqlserver_alter_table_add_primary_key() {
+    // T-SQL accepts an anonymous `ADD PRIMARY KEY`; the server names the constraint.
+    let result = build_table_structure_change_sql(structure_change_options(
+        DatabaseType::SqlServer,
+        Some("dbo"),
+        "users",
+        vec![existing_pk_column("id", "INT", false, true)],
+    ));
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["ALTER TABLE [dbo].[users] ADD PRIMARY KEY ([id]);"]);
+}
+
+#[test]
+fn sqlserver_replaces_primary_key_by_persisted_constraint_name() {
+    let mut old_pk = existing_pk_column("id", "INT", true, false);
+    old_pk.id = "old_id".to_string();
+    let mut new_pk = existing_pk_column("code", "VARCHAR(50)", false, true);
+    new_pk.id = "new_code".to_string();
+    let mut options = structure_change_options(DatabaseType::SqlServer, Some("dbo"), "users", vec![old_pk, new_pk]);
+    options.indexes = vec![existing_primary_index("PK_users", &["id"])];
+
+    let result = build_table_structure_change_sql(options);
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec![
+            "ALTER TABLE [dbo].[users] DROP CONSTRAINT [PK_users];",
+            "ALTER TABLE [dbo].[users] ADD CONSTRAINT [PK_users] PRIMARY KEY ([code]);",
+        ]
+    );
+}
+
+#[test]
+fn builds_sqlserver_alter_table_drop_primary_key() {
+    let mut options = structure_change_options(
+        DatabaseType::SqlServer,
+        Some("dbo"),
+        "users",
+        vec![existing_pk_column("id", "INT", true, false)],
+    );
+    options.indexes = vec![existing_primary_index("PK_users", &["id"])];
+
+    let result = build_table_structure_change_sql(options);
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(result.statements, vec!["ALTER TABLE [dbo].[users] DROP CONSTRAINT [PK_users];"]);
+}
+
+#[test]
 fn dameng_validates_new_primary_key_column_before_replacing_existing_key() {
     let mut old_pk = existing_pk_column("id", "INT", true, false);
     old_pk.id = "old_id".to_string();
@@ -5463,8 +5514,10 @@ fn warns_sqlite_cannot_alter_primary_key() {
 }
 
 #[test]
-fn warns_sqlserver_cannot_alter_primary_key_without_drop_strategy() {
-    // alter_primary_key is false for SQL Server; fail closed (no partial ADD-only SQL).
+fn sqlserver_requires_persisted_constraint_name_and_fails_closed_without_it() {
+    // Dropping the persisted primary key needs its constraint name from the index metadata
+    // (server-generated names have no rule); without it, emit no partial SQL (no ADD-only) and
+    // ask the user to refresh the structure (issue #10758).
     let result = build_table_structure_change_sql(structure_change_options(
         DatabaseType::SqlServer,
         Some("dbo"),
@@ -5474,7 +5527,8 @@ fn warns_sqlserver_cannot_alter_primary_key_without_drop_strategy() {
 
     assert_eq!(result.statements, Vec::<String>::new());
     assert_eq!(result.warnings.len(), 1);
-    assert!(result.warnings[0].contains("primary key"));
+    assert!(result.warnings[0].contains("SQL Server primary key constraint name"));
+    assert!(result.warnings[0].contains("Refresh"));
 }
 
 #[test]
@@ -7029,6 +7083,88 @@ fn mysql_character_column_add_with_charset_collation() {
             "ALTER TABLE `users` ADD COLUMN `name` varchar(255) CHARACTER SET `utf8mb4` COLLATE `utf8mb4_unicode_ci`;"
         ]
     );
+}
+
+#[test]
+fn single_column_alter_builder_generates_add_for_new_mysql_column() {
+    let mut col = column("category");
+    col.id = "ddl-preview:new:category".to_string();
+    col.data_type = "varchar(50)".to_string();
+    col.character_set = "utf8mb4".to_string();
+    col.collation = "utf8mb4_general_ci".to_string();
+    col.comment = "所属类别".to_string();
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Mysql),
+        driver_profile: None,
+        schema: None,
+        table_name: "apis".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec![
+            "ALTER TABLE `apis` ADD COLUMN `category` varchar(50) CHARACTER SET `utf8mb4` COLLATE `utf8mb4_general_ci` COMMENT '所属类别';"
+        ]
+    );
+}
+
+#[test]
+fn single_column_alter_builder_preserves_mysql_generated_expression_for_add_preview() {
+    let mut col = column("total");
+    col.id = "ddl-preview:existing:total".to_string();
+    col.data_type = "int".to_string();
+    col.original = Some(ColumnInfo {
+        name: "total".to_string(),
+        data_type: "int".to_string(),
+        is_nullable: true,
+        column_default: None,
+        is_primary_key: false,
+        extra: Some("GENERATED ALWAYS AS (`quantity` * `price`) STORED".to_string()),
+        comment: None,
+        character_set: None,
+        collation: None,
+    });
+    col.original_position = None;
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::Mysql),
+        driver_profile: None,
+        schema: None,
+        table_name: "orders".to_string(),
+        column: col,
+    });
+
+    assert_eq!(result.warnings, Vec::<String>::new());
+    assert_eq!(
+        result.statements,
+        vec!["ALTER TABLE `orders` ADD COLUMN `total` int GENERATED ALWAYS AS (`quantity` * `price`) STORED;"]
+    );
+}
+
+#[test]
+fn single_column_alter_builder_keeps_existing_column_without_position_as_edit() {
+    let mut col = column("id");
+    col.data_type = "INTEGER".to_string();
+    col.original = Some(ColumnInfo {
+        name: "id".to_string(),
+        data_type: "SMALLINT".to_string(),
+        is_nullable: true,
+        ..Default::default()
+    });
+
+    let result = build_single_column_alter_sql(SingleColumnAlterSqlOptions {
+        database_type: Some(DatabaseType::DuckDb),
+        driver_profile: None,
+        schema: None,
+        table_name: "issue_9980".to_string(),
+        column: col,
+    });
+
+    assert!(result.statements.is_empty());
+    assert_eq!(result.warnings, vec!["Editing existing columns is not supported for duckdb yet."]);
 }
 
 #[test]
@@ -9632,6 +9768,8 @@ fn starrocks_alter_combines_schema_changes_after_native_rename_and_comments() {
     value.name = "new`value".into();
     value.comment = "new comment".into();
     value.default_value = "hello".into();
+    value.original.as_mut().unwrap().column_default = Some("hello".into());
+    value.original.as_mut().unwrap().data_type = "varchar(50)".into();
     let mut added = column("more");
     added.data_type = "int".into();
     let mut options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![value, added]);
@@ -9643,6 +9781,68 @@ fn starrocks_alter_combines_schema_changes_after_native_rename_and_comments() {
     assert!(result.statements[1].contains("COMMENT = 'table comment'"));
     assert!(result.statements[2].contains("MODIFY COLUMN `new``value` varchar(100) NOT NULL DEFAULT 'hello' COMMENT 'new comment', ADD COLUMN `more` int NULL COMMENT '';"));
     assert!(!result.statements.join(" ").contains("CHANGE COLUMN"));
+}
+
+#[test]
+fn starrocks_alter_rejects_existing_default_changes_without_partial_sql() {
+    for (data_type, original_default, new_default) in [
+        ("decimal(7, 0)", None, "'0'"),
+        ("decimal(7, 0)", Some("'0'"), "'1'"),
+        ("datetime", None, "CURRENT_TIMESTAMP"),
+        ("datetime", Some("CURRENT_TIMESTAMP"), ""),
+    ] {
+        let mut value = existing_pk_column("value", data_type, false, false);
+        value.original.as_mut().unwrap().column_default = original_default.map(String::from);
+        value.default_value = new_default.into();
+        value.comment = "also changed".into();
+        let mut options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![value]);
+        options.table_comment = Some("must not partially execute".into());
+        let result = build_table_structure_change_sql_with_context(options, Some(starrocks_alter_context()));
+        assert!(result.statements.is_empty(), "{data_type}: {:?}", result.statements);
+        assert!(result.warnings.iter().any(|warning| warning.contains("cannot change the default value")), "{:?}", result.warnings);
+    }
+}
+
+#[test]
+fn starrocks_alter_preserves_existing_defaults_during_other_changes() {
+    for (data_type, default_value) in [("decimal(7, 0)", "'0'"), ("datetime", "CURRENT_TIMESTAMP")] {
+        let mut value = existing_pk_column("value", data_type, false, false);
+        value.original.as_mut().unwrap().column_default = Some(default_value.into());
+        value.default_value = default_value.into();
+        value.is_nullable = true;
+        let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![value]);
+        let result = build_table_structure_change_sql_with_context(options, Some(starrocks_alter_context()));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        assert!(result.statements[0].contains(&format!("NULL DEFAULT {default_value}")), "{:?}", result.statements);
+    }
+}
+
+#[test]
+fn starrocks_add_column_rejects_uuid_generators_without_partial_sql() {
+    for default_value in ["(uuid())", "uuid()", " ( UUID ( ) ) ", "(uuid_numeric())", "((UUID_NUMERIC()))"] {
+        let mut value = column("dad");
+        value.data_type = if default_value.to_ascii_lowercase().contains("numeric") { "largeint" } else { "varchar(255)" }.into();
+        value.default_value = default_value.into();
+        let mut options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![value]);
+        options.table_comment = Some("must not partially execute".into());
+        let result = build_table_structure_change_sql_with_context(options, Some(starrocks_alter_context()));
+        assert!(result.statements.is_empty(), "{default_value}: {:?}", result.statements);
+        assert!(result.warnings.iter().any(|warning| warning.contains("does not support uuid()")), "{:?}", result.warnings);
+    }
+}
+
+#[test]
+fn starrocks_add_column_keeps_type_specific_defaults() {
+    for (data_type, default_value) in [("decimal(7, 0)", "'0'"), ("datetime", "CURRENT_TIMESTAMP"), ("varchar(255)", "'uuid()'"), ("varchar(255)", "NULL")] {
+        let mut value = column("value");
+        value.data_type = data_type.into();
+        value.default_value = default_value.into();
+        let options = structure_change_options(DatabaseType::StarRocks, None, "events", vec![value]);
+        let result = build_table_structure_change_sql_with_context(options, Some(starrocks_alter_context()));
+        assert!(result.warnings.is_empty(), "{:?}", result.warnings);
+        let expected_default = if default_value == "NULL" { String::new() } else { format!(" DEFAULT {default_value}") };
+        assert!(result.statements[0].contains(&format!("ADD COLUMN `value` {data_type} NULL{expected_default} COMMENT")), "{:?}", result.statements);
+    }
 }
 
 #[test]

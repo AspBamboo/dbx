@@ -144,6 +144,13 @@ profiles:
     port: 8983
     user: ""
     category: document
+  - id: couchdb
+    dbType: couchdb
+    label: Apache CouchDB
+    icon: couchdb
+    port: 5984
+    user: ""
+    category: document
   - id: meilisearch
     dbType: meilisearch
     label: Meilisearch
@@ -544,6 +551,13 @@ profiles:
     icon: neo4j
     port: 7687
     user: neo4j
+    category: graph_ai
+  - id: nebula
+    dbType: nebula
+    label: NebulaGraph
+    icon: nebula
+    port: 9669
+    user: root
     category: graph_ai
   - id: cassandra
     dbType: cassandra
