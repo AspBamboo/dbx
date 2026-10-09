@@ -498,6 +498,7 @@ interface DataGridProps {
   sourceColumns?: Array<string | undefined>;
   joinedWriteTargets?: import("@/types/database").QueryTab["queryWriteTargets"];
   queryMultiSource?: boolean;
+  hasUniqueQueryInsertTarget?: boolean;
   readonlyColumnIndexes?: number[];
   /**
    * Column comments for a multi-source query result (e.g. JOIN), indexed by
@@ -2661,6 +2662,8 @@ const gridStyle = computed(() => ({
   [EDITOR_FONT_FAMILY_CSS_VAR]: settingsStore.editorSettings.fontFamily,
   "--dbx-data-grid-font-family": tableFontFamily.value,
   "--dbx-table-font-size": `${tableFontSize.value}px`,
+  ...(settingsStore.editorSettings.dataGridCrosshairRowBg?.trim() ? { "--data-grid-cell-crosshair-row-bg": settingsStore.editorSettings.dataGridCrosshairRowBg.trim() } : {}),
+  ...(settingsStore.editorSettings.dataGridCrosshairColBg?.trim() ? { "--data-grid-cell-crosshair-col-bg": settingsStore.editorSettings.dataGridCrosshairColBg.trim() } : {}),
 }));
 const gridHorizontalScrollLeft = ref(0);
 let gridScrollLeftBeforeTranspose = 0;
@@ -3568,7 +3571,10 @@ const canFetchNextInfiniteScrollSegment = computed(() =>
     allRowsLoaded: allRowsLoaded.value,
   }),
 );
-const canJumpLastPage = computed(() => canGoNextPage.value && (hasKnownPaginationTotalRowCount.value || allRowsLoaded.value || !!props.tableMeta || !!props.countSql || !!props.countTotalRows));
+// Editable query results also carry table metadata, but their SQL predicates
+// are not the table browser's whereInput. Never count that table as a fallback.
+const canCountTableRows = computed(() => props.context !== "results" && !!props.tableMeta);
+const canJumpLastPage = computed(() => canGoNextPage.value && (hasKnownPaginationTotalRowCount.value || allRowsLoaded.value || canCalculateTotalRowCount.value));
 const totalRowCountBusy = computed(() => props.totalRowCountLoading === true || manualTotalRowCountLoading.value);
 const pageJumpBusy = computed(() => !!props.pageJumpProgress && props.pageJumpProgress.totalRequests > 1);
 /** Automatic background counts keep rows interactive; explicit count navigation still blocks the surface. */
@@ -3583,7 +3589,7 @@ watch(
   },
   { immediate: true },
 );
-const canCalculateTotalRowCount = computed(() => !!props.countTotalRows || (!!props.connectionId && (!!props.tableMeta || !!props.countSql)));
+const canCalculateTotalRowCount = computed(() => !!props.countTotalRows || (!!props.connectionId && (canCountTableRows.value || !!props.countSql)));
 const showExactTotalCountAction = computed(() => canCalculateTotalRowCount.value && (totalRowCountIsExact.value === false || typeof displayedTotalRowCount.value !== "number"));
 const showRerunTotalCountAction = computed(() =>
   showDataGridRerunTotalCountAction({
@@ -4020,7 +4026,7 @@ async function lastPage() {
     }
     return;
   }
-  if (props.connectionId && (props.countSql || props.tableMeta)) {
+  if (props.connectionId && (props.countSql || canCountTableRows.value)) {
     const generation = await beginManualTotalRowCount();
     if (generation === undefined) return;
     try {
@@ -4064,7 +4070,7 @@ function handleGridPaginationShortcut(event: KeyboardEvent): boolean {
 
 async function buildCurrentCountTarget(): Promise<{ sql: string; schema?: string } | undefined> {
   if (props.countSql) return { sql: props.countSql, schema: props.schema };
-  if (props.tableMeta) {
+  if (canCountTableRows.value && props.tableMeta) {
     const countHint = resolvedDatabaseType.value === "gaussdb" && props.connectionId ? gaussdbCountQueryDopHint(connectionStore.getConfig(props.connectionId)) : undefined;
     const sql = await buildDataGridCountSql({
       databaseType: props.databaseType,
@@ -7460,7 +7466,7 @@ const dataGridTypeColorKey = computed(() => {
 });
 const canvasRenderStyleKey = computed(
   () =>
-    `${settingsStore.editorSettings.theme}:${settingsStore.editorSettings.uiScale}:${canvasBackingPixelRatio.value}:${isDark.value}:${themePalette.value}:${tableFontFamily.value}:${tableFontSize.value}:${!!saveError.value}:${dataGridTypeColorKey.value}:${dataGridStripedRows.value}:${settingsStore.editorSettings.dataGridZebraRowBg}`,
+    `${settingsStore.editorSettings.theme}:${settingsStore.editorSettings.uiScale}:${canvasBackingPixelRatio.value}:${isDark.value}:${themePalette.value}:${tableFontFamily.value}:${tableFontSize.value}:${!!saveError.value}:${dataGridTypeColorKey.value}:${dataGridStripedRows.value}:${settingsStore.editorSettings.dataGridZebraRowBg}:${settingsStore.editorSettings.dataGridCrosshairRowBg}:${settingsStore.editorSettings.dataGridCrosshairColBg}`,
 );
 const CANVAS_MOUSE_WHEEL_SCROLL_MULTIPLIER = 1.5;
 const CANVAS_TRACKPAD_DELTA_THRESHOLD = 40;
@@ -8242,6 +8248,8 @@ function drawCanvasGrid() {
     showWhitespace: showWhitespaceEnabled.value,
     stripedRows: dataGridStripedRows.value,
     zebraRowBg: settingsStore.editorSettings.dataGridZebraRowBg,
+    crosshairRowBg: settingsStore.editorSettings.dataGridCrosshairRowBg,
+    crosshairColBg: settingsStore.editorSettings.dataGridCrosshairColBg,
     rowNumberMode: dataGridRowNumberMode.value,
   });
   if (!drawn) return;
@@ -8558,6 +8566,7 @@ const {
   pageSql: computed(() => props.pageSql),
   tableMeta: computed(() => (props.tableMeta ? { ...props.tableMeta } : undefined)),
   includeDatabaseName: computed(() => settingsStore.editorSettings.generateSqlIncludeDatabaseName),
+  hasUniqueQueryInsertTarget: computed(() => props.hasUniqueQueryInsertTarget === true),
   copyInsertTargetLabel: computed(() => props.tableMeta?.tableName ?? props.customSaveHandler?.targetLabel),
   mongoUpdateTarget: computed(() => props.mongoUpdateTarget),
   databaseType: computed(() => props.databaseType),
@@ -10472,8 +10481,10 @@ function downloadCellBinaryValue(rowIndex: number, columnIndex: number, mode: Bi
 async function downloadDetailBinaryValue(detail: DataGridCellDetail | null, mode: BinaryCellDownloadMode) {
   if (!detail || !canDownloadDetailBinaryValue(detail)) return;
   try {
+    const sourceResult = props.result;
     if (!(await hydrateLargeValueCell(detail.rowId, detail.colIndex))) return;
-    const resolvedDetail = cellDetailFor(detail.rowNumber - 1, detail.colIndex);
+    if (props.result !== sourceResult) return;
+    const resolvedDetail = cellDetailFor(displayRowIndexById(detail.rowId), detail.colIndex);
     if (!resolvedDetail) return;
     const payload = binaryCellDownloadPayload(resolvedDetail.value, mode, resolvedDetail.type, resolvedDatabaseType.value);
     const fileName = binaryCellDownloadFileName({
@@ -15342,6 +15353,7 @@ useUpdateBlocker(() => (hasPendingChanges.value || hasPendingDataEditorDraft.val
         :load-all-rows-active="loadAllRowsActive"
         :load-all-rows-enabled="loadAllRowsEnabled"
         :can-load-all-rows="result.rows.length > 0"
+        :can-export="result.columns.length > 0"
         :page-size="pageSize"
         :default-page-size="defaultPageSize"
         :page-size-menu-items="pageSizeMenuItems"
