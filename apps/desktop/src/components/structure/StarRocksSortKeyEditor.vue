@@ -36,7 +36,7 @@ function move(index: number, offset: number) {
 }
 </script>
 <template>
-  <details open class="shrink-0 rounded-md border bg-muted/10 px-3 py-2" data-starrocks-edit-sort>
+  <details class="shrink-0 rounded-md border bg-muted/10 px-3 py-2" data-starrocks-edit-sort>
     <summary class="cursor-pointer font-medium">{{ t("starrocksLayout.sortColumns") }}</summary>
     <div class="mt-2 max-h-48 space-y-2 overflow-y-auto">
       <StructureColumnMultiSelect :model-value="modelValue" :columns="available" :label="t('starrocksLayout.sortColumns')" :disabled="disabled || !supported" @update:model-value="emit('update:modelValue', $event)" />
